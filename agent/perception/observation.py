@@ -108,6 +108,17 @@ class Observation:
     # that just navigated is the signal that the previous page's scroll
     # persisted (Walmart SPA behaviour) and we may have missed elements above.
     scroll_y: int = 0
+    # What a scroll moves: "page", an open modal "dialog", or an app "panel"
+    # when the page itself cannot scroll. `can_scroll_*` describe this area.
+    scroll_area: str = "page"
+    # Viewport point at the centre of a dialog or panel scroller, where a
+    # wheel must land to move it. None for the page.
+    scroll_point: tuple[int, int] | None = None
+    # Pixels per scroll for that dialog or panel: most of its height, so no
+    # row is skipped. None keeps the page step.
+    scroll_step: int | None = None
+    # The open modal dialog's own text. None when no modal is open.
+    dialog_text: str | None = None
     # How many times `observe` re-read the page waiting for hydration.
     # Diagnostic only; 0 for a page that read cleanly on the first try.
     hydration_retries: int = 0

@@ -31,6 +31,9 @@ class Action:
     role: str | None = None
     value: str | None = None
     delta: int = 0
+    # Scroll only: the viewport point the wheel lands on, so it moves an open
+    # dialog's or panel's own scroller. None keeps the page-level default.
+    point: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)

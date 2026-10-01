@@ -194,6 +194,7 @@ class Supervisor:
             text_preview=observation.text[:240],
             marker=observation.marker,
             scroll_y=observation.scroll_y,
+            scroll_area=observation.scroll_area,
             hydration_retries=observation.hydration_retries,
             loading=observation.loading,
             viewport_w=observation.viewport[0],
@@ -264,6 +265,8 @@ class Supervisor:
             model=decision.model,
             banned=sorted(banned),
             offered={op: list(labels) for op, labels in decision.offered.items()},
+            dialog=decision.dialog or "",
+            dialog_p=decision.dialog_p,
         ))
         return decision
 
@@ -386,6 +389,8 @@ class Supervisor:
 
     def _bounds_for(self, observation: Observation, action: Action) -> tuple[float, float, float, float] | None:
         """Look up the target element's bounding rect for the cursor overlay."""
+        if action.kind == "scroll" and action.point is not None:
+            return (action.point[0] - 1, action.point[1] - 1, 2, 2)  # the wheel point
         if not action.locator:
             return None
         element = observation.by_ref(action.locator)

@@ -540,11 +540,14 @@ class PlaywrightExecutor:
         cdp = await self._ensure_cdp()
         # Fixed (400, 400) is inside every reasonable viewport. Old jevis
         # uses (550, 650). Absolute value doesn't matter for a wheel event
-        # as long as it's inside a scrollable region.
+        # as long as it's inside a scrollable region — which an open dialog
+        # is not: a wheel beside it lands on the backdrop of a locked page.
+        # The reader then supplies the dialog's (or panel's) own centre.
+        x, y = action.point or (400, 400)
         await cdp.send("Input.dispatchMouseEvent", {
             "type": "mouseWheel",
-            "x": 400,
-            "y": 400,
+            "x": x,
+            "y": y,
             "deltaX": 0,
             "deltaY": action.delta,
         })

@@ -170,8 +170,19 @@ async def observe(page: Page, *, include_text: bool = True) -> Observation:
         viewport=(int(viewport[0]), int(viewport[1])),
         loading=bool(state.get("loading", False)),
         scroll_y=int(state.get("scroll_y", 0)),
+        scroll_area=str(state.get("scroll_area") or "page"),
+        scroll_point=_point(state.get("scroll_point")),
+        scroll_step=int(state["scroll_step"]) if state.get("scroll_step") else None,
+        dialog_text=state.get("dialog_text") or None,
         hydration_retries=int(state.get("_retries", 0)),
     )
+
+
+def _point(raw: object) -> tuple[int, int] | None:
+    """`[x, y]` from the reader, or None."""
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        return (int(raw[0]), int(raw[1]))
+    return None
 
 
 async def _evaluate_reader(page: Page, *, include_text: bool) -> dict:
@@ -200,3 +211,144 @@ async def _evaluate_reader(page: Page, *, include_text: bool) -> dict:
             except PlaywrightTimeout:
                 await page.wait_for_timeout(50 * (attempt + 1))
     raise RuntimeError(f"DOM reader failed after retries: {last_error}")
+
+
+# ---- Inline tests: `uv run python -m agent.perception.dom` ---------------------------
+# Headless Chromium on fixed HTML. One unit test per scroll gap, then two end to
+# end through PlaywrightExecutor and `decide()` with a stand-in Jev answer.
+
+
+class ScrollTestFailure(AssertionError):
+    """An inline scroll test saw the wrong result."""
+
+
+# A locked page behind a modal whose 300px scroller holds the options, as on
+# DoorDash: Chicken and Steak in view, Barbacoa clipped below the box but still
+# inside the viewport, Carnitas below the viewport.
+_MODAL_PAGE = """<!doctype html><html><body style="margin:0;overflow:hidden">
+<button style="position:fixed;left:10px;top:10px">Background add</button>
+<div role="dialog" aria-modal="true" style="position:fixed;left:455px;top:40px;width:560px;background:#fff">
+  <button style="height:20px">Close</button>
+  <div id="sc" style="height:300px;overflow:auto">
+    <label style="display:block;height:60px"><input type="radio" name="p"> Chicken</label>
+    <label style="display:block;height:60px"><input type="radio" name="p"> Steak</label>
+    <div style="height:280px"></div>
+    <label style="display:block;height:60px"><input type="radio" name="p"> Beef Barbacoa</label>
+    <div style="height:900px"></div>
+    <label style="display:block;height:60px"><input type="radio" name="p"> Carnitas</label>
+  </div>
+</div></body></html>"""
+
+_LONG_PAGE = """<!doctype html><html><body style="margin:0">
+<button>Top</button><div style="height:3000px"></div><button>Bottom</button></body></html>"""
+
+
+def _names(observation: Observation) -> list[str]:
+    return [element.name for element in observation.elements]
+
+
+async def _unit_tests() -> None:
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        await page.set_content(_MODAL_PAGE)
+        before = await observe(page)
+        # Gap 1: scroll state comes from the dialog's scroller, not the locked body.
+        if before.scroll_area != "dialog" or not before.can_scroll_down or before.can_scroll_up:
+            raise ScrollTestFailure(f"dialog scroll state wrong: {before.scroll_area} "
+                                    f"down={before.can_scroll_down} up={before.can_scroll_up}")
+        # Gap 2: the wheel point is inside the dialog's scroller.
+        point = before.scroll_point
+        if point is None or not (455 <= point[0] <= 1015 and 60 <= point[1] <= 360):
+            raise ScrollTestFailure(f"scroll point outside the dialog scroller: {point}")
+        # Gap 3: a control clipped by the scroller is not offered, though inside the viewport.
+        if any("Barbacoa" in name for name in _names(before)):
+            raise ScrollTestFailure("clipped option was offered")
+        # Gap 4: controls behind an open modal are not offered.
+        if "Background add" in _names(before) or "Close" not in _names(before):
+            raise ScrollTestFailure(f"modal filter wrong: {_names(before)}")
+        # Gap 5: a scroll inside the dialog changes the marker.
+        await page.evaluate("document.getElementById('sc').scrollTop = 10")
+        if (await observe(page)).marker == before.marker:
+            raise ScrollTestFailure("marker ignored a scroll inside the dialog")
+        # Gap 6: the step fits the box (80% of 300px), so no row is skipped.
+        if before.scroll_step != 240:
+            raise ScrollTestFailure(f"scroll step {before.scroll_step}, wanted 240")
+        # Regression: an ordinary long page keeps the page path unchanged.
+        await page.set_content(_LONG_PAGE)
+        plain = await observe(page)
+        if (plain.scroll_area, plain.scroll_point, plain.scroll_step) != ("page", None, None) \
+                or not plain.can_scroll_down:
+            raise ScrollTestFailure(f"page path changed: {plain.scroll_area} {plain.scroll_point}")
+        await browser.close()
+
+
+class _ScrollJev:
+    """Stands in for JevClient: always answers SCROLL_DOWN, records the state sent."""
+
+    def __init__(self) -> None:
+        self.state: dict | None = None
+
+    async def ask(self, *, state: dict, questions: dict):  # noqa: ANN201
+        from agent.providers import ChoiceAnswer, JevResult
+
+        if "operation" not in questions:  # the dialog diagnosis: give none
+            return JevResult(answers={}, model="stand-in", usage={}, latency_ms=0)
+        self.state = state
+        options = questions["operation"]["criteria"]
+        answer = ChoiceAnswer(choice="SCROLL_DOWN",
+                              probabilities={key: float(key == "SCROLL_DOWN") for key in options},
+                              confidence=1.0)
+        return JevResult(answers={"operation": answer}, model="stand-in", usage={}, latency_ms=0)
+
+
+async def _executor_scroll(html: str) -> tuple[Observation, Observation, _ScrollJev]:
+    """Decide SCROLL_DOWN on `html` through the real policy code, act, re-observe."""
+    import os
+
+    from agent.executor import PlaywrightExecutor
+    from agent.policy.jev_policy import decide
+
+    for key in ("AGENT_CDP_URL", "AGENT_CHROME_PROFILE", "AGENT_CHROME_CHANNEL"):
+        os.environ.pop(key, None)
+    os.environ["AGENT_PROFILE_DIR"] = "none"  # never touch the saved profile
+    jev = _ScrollJev()
+    async with PlaywrightExecutor(headless=True) as executor:
+        await executor.page.set_content(html)
+        before = await observe(executor.page)
+        decision = await decide(client=jev, observation=before, goal="Choose Beef Barbacoa.", history=[])  # type: ignore[arg-type]
+        await executor.act(decision.action)
+        await executor.page.wait_for_timeout(300)
+        after = await observe(executor.page)
+    return before, after, jev
+
+
+async def _e2e_dialog_scroll() -> None:
+    """End to end: SCROLL_DOWN on a dialog moves the dialog and reveals Barbacoa."""
+    before, after, jev = await _executor_scroll(_MODAL_PAGE)
+    if (jev.state or {}).get("page", {}).get("scroll_area") != "dialog":
+        raise ScrollTestFailure("policy state did not say the dialog scrolls")
+    if not any("Barbacoa" in name for name in _names(after)):
+        raise ScrollTestFailure(f"Barbacoa not revealed after scroll: {_names(after)}")
+    if after.marker == before.marker:
+        raise ScrollTestFailure("scroll did not register as a page change")
+
+
+async def _e2e_page_scroll() -> None:
+    """End to end: on an ordinary page, SCROLL_DOWN still scrolls the page."""
+    before, after, jev = await _executor_scroll(_LONG_PAGE)
+    if "scroll_area" in (jev.state or {}).get("page", {}):
+        raise ScrollTestFailure("page request gained a scroll_area field")
+    if after.scroll_y <= before.scroll_y:
+        raise ScrollTestFailure(f"page did not scroll: {before.scroll_y} -> {after.scroll_y}")
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(_unit_tests())
+    asyncio.run(_e2e_dialog_scroll())
+    asyncio.run(_e2e_page_scroll())
+    print("dom.py inline scroll tests passed")

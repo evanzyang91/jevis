@@ -13,7 +13,9 @@ Take that end state once per item: a product already added counts as that item, 
 only the closest match, so never add a second product for the same item.
 Always act on the first unfinished requirement; never revisit a finished one.
 In priority order:
-1. Dismiss any cookie banner, popup, or dialog covering the page (prefer accept/close).
+1. Dismiss any cookie banner, popup, or dialog covering the page (prefer accept/close), unless
+   `page.dialog` is "task". A task dialog holds what the goal needs, such as the item's options:
+   never close it. Choose its options, SCROLL inside it, then use its add or confirm control.
 2. If a typed query sits in a search field, CLICK its matching suggestion or the Search
    button, or choose ENTER when neither exists — many searches submit only on Enter.
    Retyping or clearing that query is never progress.
@@ -92,6 +94,24 @@ Reply with a JSON object only. Two keys, met and reason.
 met is true when every requirement is visibly present on the current page, false otherwise.
 reason is one short sentence naming the concrete evidence, or the concrete gap when met is false.
 Return the JSON object only, and nothing after it."""
+
+DIALOG_KIND = {
+    "question": "Is the open dialog in `dialog` a step of `goal`, or an interruption to dismiss?",
+    "rules": "Judge only the dialog's own text and controls. The page behind it does not count.",
+}
+
+DIALOG_KINDS = {
+    "task": (
+        "The dialog shows the item, product, or form the goal needs, or a choice the goal requires: "
+        "the item's options, a size, a quantity, a protein or topping, or the item's add or confirm "
+        "control. Using its controls advances the goal."
+    ),
+    "interruption": (
+        "The dialog is not part of the goal: cookie or privacy consent, a promotion, a newsletter, "
+        "an app download, a survey, a sign-in or location prompt, or suggestions of other stores or "
+        "items. The goal continues only after it is closed."
+    ),
+}
 
 CLASSIFY = """Choose the category that best matches the user goal.
 Read the goal and the site address. Choose the closest fit."""

@@ -197,6 +197,63 @@
     (el.getAttribute("href") || "").slice(0, 200),
   ]));
 
+  // ---- Scroll area ------------------------------------------------------
+  // What a scroll action should move. An open modal dialog blocks the page
+  // behind it (sites lock body scroll while it is open), so the dialog's own
+  // scroller wins. Without a modal the page scrolls, unless the page cannot
+  // and an app-style panel does. Scroll state is measured on that area, not
+  // on document.body: a DoorDash item dialog scrolls a 585px box over a
+  // locked 9943px body, and its required options sit below that box's fold.
+  const SCROLLABLE_Y = new Set(["auto", "scroll", "overlay"]);
+  const canScrollY = (el) => el.scrollHeight > el.clientHeight + 4
+    && SCROLLABLE_Y.has(getComputedStyle(el).overflowY);
+  const largestScroller = (root) => {
+    let best = null;
+    let bestArea = 0;
+    for (const el of [root, ...root.querySelectorAll("*")]) {
+      if (!canScrollY(el) || !isVisible(el)) continue;
+      const area = el.clientWidth * el.clientHeight;
+      if (area > bestArea) {
+        best = el;
+        bestArea = area;
+      }
+    }
+    return best;
+  };
+  const centerIn = (rect, area) => {
+    const cx = rect.x + rect.w / 2;
+    const cy = rect.y + rect.h / 2;
+    return cx >= area.x && cx < area.x + area.w && cy >= area.y && cy < area.y + area.h;
+  };
+  // The topmost open modal. `aria-modal` or a native modal <dialog> only: a
+  // non-modal role="dialog" (a chat widget, a toast) leaves the page usable.
+  const modal = [...document.querySelectorAll('[aria-modal="true"],dialog')]
+    .filter((el) => (el.getAttribute("aria-modal") === "true" || el.matches(":modal")) && isVisible(el))
+    .pop() || null;
+  const doc = document.scrollingElement || document.documentElement;
+  const pageScrolls = doc.scrollHeight > innerHeight + 4
+    && getComputedStyle(doc).overflowY !== "hidden"
+    && !(document.body && getComputedStyle(document.body).overflowY === "hidden");
+  let scrollArea = "page";
+  let scroller = null;
+  if (modal) {
+    scrollArea = "dialog";
+    scroller = largestScroller(modal);
+  } else if (!pageScrolls && document.body) {
+    scroller = largestScroller(document.body);
+    if (scroller) scrollArea = "panel";
+  }
+  // The part of the scroller inside the viewport: where a wheel must land,
+  // and the box a control's centre must sit in to be seen.
+  let scrollBox = { x: 0, y: 0, w: innerWidth, h: innerHeight };
+  if (scroller) {
+    const r = scroller.getBoundingClientRect();
+    const x = Math.max(r.x, 0);
+    const y = Math.max(r.y, 0);
+    scrollBox = { x, y, w: Math.min(r.right, innerWidth) - x, h: Math.min(r.bottom, innerHeight) - y };
+  }
+  const scrollTop = scroller ? scroller.scrollTop : (modal ? 0 : scrollY);
+
   // Clear previous stamps so the page never accumulates them.
   for (const stamped of document.querySelectorAll("[data-agent-ref]")) {
     stamped.removeAttribute("data-agent-ref");
@@ -219,6 +276,9 @@
   for (const el of document.querySelectorAll(roots)) {
     if (elements.length >= MAX_ELEMENTS) break;
     if (seen.has(el)) continue;
+    // An open modal makes the page behind it inert: a click there lands on
+    // the backdrop. Offering those controls let a run "add" a background item.
+    if (modal && !modal.contains(el)) continue;
     if (!isVisible(el)) continue;
     if (isDisabled(el)) continue;
     if (el.type === "password" || el.type === "file") continue;
@@ -228,6 +288,8 @@
     const bounds = boundsOf(el);
     if (bounds.w <= 0 || bounds.h <= 0) continue;
     if (!centerInViewport(bounds)) continue;
+    // Inside the viewport but scrolled out of its own box: hidden, not offered.
+    if (scroller && scroller.contains(el) && !centerIn(bounds, scrollBox)) continue;
     seen.add(el);
     // Never drop an element for lacking a computed accessible name: on a
     // mid-hydration page (Walmart search results, Amazon), product buttons
@@ -260,6 +322,8 @@
   const markerParts = [
     location.href,
     scrollX, scrollY, innerWidth, innerHeight,
+    // A scroll inside a dialog or panel moves this and nothing above it.
+    scrollArea, Math.round(scrollTop),
     document.title,
     elements.length,
     ...elements.map((e) => e.role + "|" + e.name).slice(0, 32),
@@ -273,6 +337,9 @@
   // `document.body` can be null on interstitial redirect pages that ship
   // only a <head> before the JS reroute fires. Guard every access.
   const bodyHeight = (document.body && document.body.scrollHeight) || 0;
+  const canScrollDown = scroller
+    ? scroller.scrollTop + scroller.clientHeight < scroller.scrollHeight - 4
+    : !modal && bodyHeight > 0 && (scrollY + innerHeight) < (bodyHeight - 4);
 
   // `loading` is advisory (not part of the marker): lets the model choose
   // Wait deliberately instead of picking a stale action that will not fire.
@@ -289,8 +356,20 @@
     loading,
     scroll_y: Math.round(scrollY),
     can_go_back: history.length > 1,
-    can_scroll_up: scrollY > 4,
-    can_scroll_down: bodyHeight > 0 && (scrollY + innerHeight) < (bodyHeight - 4),
+    can_scroll_up: scrollTop > 4,
+    can_scroll_down: canScrollDown,
+    scroll_area: scrollArea,
+    // The open modal's own text, for judging what the dialog is. The page
+    // text above also holds everything behind it.
+    dialog_text: modal ? (modal.innerText || "").replace(/\s+/g, " ").trim().slice(0, 1500) : null,
+    // Only for a dialog or panel. The page keeps the executor's fixed wheel
+    // point, which Walmart's hover-sensitive tiles were tuned against.
+    scroll_point: scroller && scrollBox.w > 0 && scrollBox.h > 0
+      ? [Math.round(scrollBox.x + scrollBox.w / 2), Math.round(scrollBox.y + scrollBox.h / 2)]
+      : null,
+    // A dialog box can be shorter than the page step (700px), which would
+    // jump past whole option rows. Scroll 80% of the box, keeping overlap.
+    scroll_step: scroller && scrollBox.h > 0 ? Math.max(100, Math.round(scrollBox.h * 0.8)) : null,
     viewport: [innerWidth, innerHeight],
   };
 })

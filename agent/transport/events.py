@@ -72,6 +72,8 @@ class ObservationEvent(_EventBase):
     # the previous page's scroll persisted and we may have missed content
     # above the fold.
     scroll_y: int = 0
+    # "page", "dialog", or "panel": what a scroll on this observation moves.
+    scroll_area: str = "page"
     # How many times observe() re-read waiting for hydration. > 0 means the
     # page was shell-only on the first try; the actual delivered observation
     # is the settled one.
@@ -109,6 +111,10 @@ class DecisionEvent(_EventBase):
     # low-confidence pick that skipped Add-to-cart is diagnosable only if the
     # log shows whether Add-to-cart was in the choice set at all.
     offered: dict[str, list[str]] = Field(default_factory=dict)
+    # An open modal's diagnosis ("task" or "interruption") and its probability.
+    # Empty when no modal was open or the diagnosis was not confident.
+    dialog: str = ""
+    dialog_p: float = 0.0
 
 
 # ---- Execution --------------------------------------------------------------
