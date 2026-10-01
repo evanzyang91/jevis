@@ -201,6 +201,7 @@ export function money(usd: number): string {
   return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
 }
 
-export const percent = (value: number) => `${(value * 100).toFixed(value < 0.01 ? 1 : 0)}%`;
+export const percent = (value: number) =>
+  value === 0 ? "0%" : value < 0.001 ? "<0.1%" : `${(value * 100).toFixed(value < 0.01 ? 1 : 0)}%`;
 
 export const seconds = (ms: number, digits = 2) => `${(ms / 1000).toFixed(digits)} s`;

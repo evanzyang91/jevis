@@ -3,8 +3,8 @@
 // Overlay canvas above the screencast. Renders the synthetic cursor, its
 // fading trail, click ripples, focus pulses, and typing tags.
 //
-// No colour tokens, no radii, no fonts — the design system replaces every
-// visual constant that lives in this file.
+// The typing tag uses the page's Jevis purple (--logo); the canvas strokes
+// keep their own fixed colours, drawn over the site's pixels.
 
 import { useEffect, useRef, useState } from "react";
 import type {
@@ -172,11 +172,12 @@ export function CursorLayer({ captureW, captureH, onEvent }: Props) {
             top: `${(100 * stateRef.current.y) / captureH}%`,
             transform: "translate(-100%, -140%)",
             padding: "4px 8px",
-            background: "var(--pine)",
-            color: "var(--on-pine)",
+            borderRadius: 6,
+            background: "var(--logo)",
+            color: "#fff",
             fontSize: 12,
             fontWeight: 500,
-            fontFamily: "var(--font-sans)",
+            fontFamily: "inherit",
             maxWidth: "60%",
             whiteSpace: "nowrap",
             overflow: "hidden",

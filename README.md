@@ -5,7 +5,7 @@ A browser agent that chooses actions from a typed action space.
 ## What is here
 
 - `agent/` — Python. Executor (Playwright), perception (DOM reader), policy (Jev), planner, supervisor, memory, providers, transport, HTTP + WebSocket server.
-- `web/` — Next.js 15 App Router. User route at `/`, developer route at `/dev`.
+- `web/` — Next.js 15 App Router. One route at `/`; its Developer toggle opens the decision inspector.
 - `db/` — Postgres migrations and sqlc queries.
 - `docker-compose.yml` — local Postgres.
 
@@ -65,7 +65,7 @@ pnpm dev
 
 Open http://localhost:3000. Enter a goal and click Start. The agent opens a real Chromium window (visible), streams frames to the UI, and drives the page.
 
-Developer view: http://localhost:3000/dev — paste the run id you see in the URL bar or in the terminal.
+Developer view: turn on **Developer** in the page header. It shows the live browser, the policy's ranked choices, the decision trail, and a trace export.
 
 ### Troubleshooting
 

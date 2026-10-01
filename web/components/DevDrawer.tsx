@@ -39,13 +39,6 @@ export function DevDrawer({ run, frame, cursor, models, model, onModel, busy }: 
             </option>
           ))}
         </select>
-        <span className="tool-spacer" />
-        <a className="dev-link" href="/dev">
-          Full inspector
-        </a>
-        <a className="dev-link" href="/dev/playbooks">
-          Playbooks
-        </a>
       </div>
 
       <div className="workspace">
@@ -213,23 +206,35 @@ function Trail({ run }: { run: Run | null }) {
           Export trace ↓
         </button>
       </div>
-      {steps.length === 0 && <p className="muted">Each executed action leaves an observed result.</p>}
-      {steps.map((step, i) => (
-        <div key={step.action.seq} className="trace-row">
-          <span className="number">{String(i + 1).padStart(2, "0")}</span>
-          <div>
-            {stepText(step)}
-            {step.action.target_label && step.action.action_kind !== "click" && <small>{step.action.target_label}</small>}
+      {steps.length === 0 ? (
+        <p className="muted">Each executed action leaves an observed result.</p>
+      ) : (
+        <div className="trace-table" role="table">
+          <div className="trace-row head" role="row">
+            <span>#</span>
+            <span>Action</span>
+            <span className="num">Model</span>
+            <span className="num">Load</span>
+            <span className="num">Conf.</span>
+            <span className="num">Effect</span>
           </div>
-          <span className="time">
-            {step.decision ? `${step.decision.latency_ms} ms model` : "–"} · {step.outcome ? `${step.outcome.load_ms} ms load` : "–"}
-            <small>{step.decision ? percent(step.decision.confidence) : ""}</small>
-          </span>
-          <span className="effect">
-            {step.outcome ? (step.outcome.page_changed ? "Page changed" : "No change observed") : "…"}
-          </span>
+          {steps.map((step, i) => (
+            <div key={step.action.seq} className="trace-row" role="row">
+              <span className="number">{String(i + 1).padStart(2, "0")}</span>
+              <div className="trace-action">
+                {stepText(step)}
+                {step.action.target_label && step.action.action_kind !== "click" && <small>{step.action.target_label}</small>}
+              </div>
+              <span className="num">{step.decision ? `${step.decision.latency_ms} ms` : "–"}</span>
+              <span className="num">{step.outcome ? `${step.outcome.load_ms} ms` : "–"}</span>
+              <span className="num">{step.decision ? percent(step.decision.confidence) : "–"}</span>
+              <span className={`num effect ${step.outcome && !step.outcome.page_changed ? "none" : ""}`}>
+                {step.outcome ? (step.outcome.page_changed ? "Page changed" : "No change") : "…"}
+              </span>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
     </div>
   );
 }

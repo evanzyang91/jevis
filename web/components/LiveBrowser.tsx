@@ -2,11 +2,11 @@
 
 // The controlled tab, live: the screencast with the agent's cursor drawn over it.
 
-import { CursorLayer } from "@/components/CursorLayer";
-import { ScreencastFrame } from "@/components/ScreencastFrame";
 import type { FrameEvent } from "@/lib/events";
 
 import type { CursorRegistry } from "./cursor";
+import { CursorLayer } from "./CursorLayer";
+import { ScreencastFrame } from "./ScreencastFrame";
 
 type Props = {
   frame: FrameEvent | null;

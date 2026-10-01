@@ -7,24 +7,39 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { DevDrawer } from "@/components/home/DevDrawer";
-import { Logo } from "@/components/home/Logo";
-import { Turn } from "@/components/home/Turn";
-import { type CursorEvent, isCursorEvent } from "@/components/home/cursor";
+import { DevDrawer } from "@/components/DevDrawer";
+import { Logo } from "@/components/Logo";
+import { Turn } from "@/components/Turn";
+import { type CursorEvent, isCursorEvent } from "@/components/cursor";
 import type { FrameEvent } from "@/lib/events";
 import { type Run, isTerminal, newRun, reduce, seconds } from "@/lib/run";
 import { useFollowBottom } from "@/lib/follow";
 import { useVoice } from "@/lib/voice";
 import { subscribeEvents, subscribeFrames } from "@/lib/ws";
 
-import "./home.css";
 
-// Suggestion cards: the task, and a line icon for its kind of work.
-const EXAMPLES: { text: string; icon: string }[] = [
-  { text: "Add the ingredients for a chocolate cake to my cart", icon: "M3 4h2l2.4 11h10.2L20 7H6.2M9 20h.01M17 20h.01" },
-  { text: "Order me a barbacoa bowl from Chipotle", icon: "M4 11h16a8 8 0 0 1-16 0ZM8 7c0-1 1-2 2-2M12 7c0-1.5 1-3 2.5-3" },
-  { text: "Find a highly rated wireless mouse under $50", icon: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14ZM20 20l-4-4" },
-  { text: "Open the Wikipedia article on Gödel's incompleteness theorems", icon: "M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3V4ZM17 20h2V7" },
+// Suggestion cards: the task, the site it starts on, and a line icon for its kind of work.
+const EXAMPLES: { text: string; url: string; icon: string }[] = [
+  {
+    text: "Add the ingredients for a chocolate cake to my cart",
+    url: "https://www.walmart.ca/en",
+    icon: "M3 4h2l2.4 11h10.2L20 7H6.2M9 20h.01M17 20h.01",
+  },
+  {
+    text: "Order me a barbacoa bowl from Chipotle",
+    url: "https://www.doordash.com/store/chipotle-waterloo-36154775/81102878/",
+    icon: "M4 11h16a8 8 0 0 1-16 0ZM8 7c0-1 1-2 2-2M12 7c0-1.5 1-3 2.5-3",
+  },
+  {
+    text: "Find a highly rated wireless mouse under $50",
+    url: "https://www.amazon.ca/",
+    icon: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14ZM20 20l-4-4",
+  },
+  {
+    text: "Open the Wikipedia article on Gödel's incompleteness theorems",
+    url: "https://en.wikipedia.org/",
+    icon: "M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3V4ZM17 20h2V7",
+  },
 ];
 
 const STATUS_LINE: Record<Run["status"], string> = {
@@ -153,7 +168,6 @@ export default function Home() {
       setRuns((prior) => [...prior, newRun(data.run_id, request)]);
       followBottom();
       setGoal("");
-      remember("agent.lastRunId", data.run_id); // the full inspector at /dev opens this run
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -244,6 +258,7 @@ export default function Home() {
                     className="example"
                     onClick={() => {
                       setGoal(example.text);
+                      setUrl(example.url);
                       goalBox.current?.focus();
                     }}
                   >
