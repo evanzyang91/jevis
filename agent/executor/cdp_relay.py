@@ -118,6 +118,68 @@ def visible_targets(infos: list[dict[str, Any]], allowed: set[str]) -> list[dict
     return [info for info in infos if info.get("targetId") in allowed or info.get("openerId") in allowed]
 
 
+class _Link:
+    """One debugging socket to Chrome, shared by every relay in this event loop.
+
+    Chrome's built-in remote-debugging switch asks "Allow?" for each new
+    connection. Sharing one connection means one prompt per process (the agent
+    server, or a test suite) instead of one per run. Relays use it one at a
+    time: the current `owner` receives every message that is not a reply to
+    the link's own calls."""
+
+    _open: dict[tuple[int, str], "_Link"] = {}
+
+    def __init__(self, url: str, socket: Any) -> None:
+        self.url, self.socket = url, socket
+        self.ids = itertools.count(_RELAY_ID_BASE)
+        self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.owner: CdpTabRelay | None = None
+        self.reader = asyncio.create_task(self._read())
+
+    @classmethod
+    async def get(cls, url: str) -> "_Link":
+        key = (id(asyncio.get_running_loop()), url)
+        link = cls._open.get(key)
+        if link is not None and not link.reader.done():
+            return link
+        try:
+            socket = await websockets.connect(url, max_size=None, open_timeout=_UPSTREAM_OPEN_TIMEOUT_S)
+        except Exception as err:  # noqa: BLE001 — one clear message for every connect failure
+            raise RelayError(f"Could not open Chrome's debugging socket at {url}: {err}") from err
+        link = cls(url, socket)
+        cls._open[key] = link
+        await link.call("Target.setDiscoverTargets", {"discover": True})
+        return link
+
+    async def call(self, method: str, params: dict[str, Any] | None = None,
+                   session: str | None = None) -> dict[str, Any]:
+        call_id = next(self.ids)
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.pending[call_id] = future
+        message: dict[str, Any] = {"id": call_id, "method": method, "params": params or {}}
+        if session:
+            message["sessionId"] = session
+        await self.socket.send(json.dumps(message))
+        reply = await asyncio.wait_for(future, _CALL_TIMEOUT_S)
+        if "error" in reply:
+            raise RelayError(f"{method} failed: {reply['error'].get('message')}")
+        return reply.get("result", {})
+
+    async def _read(self) -> None:
+        try:
+            async for raw in self.socket:
+                message = json.loads(raw)
+                call_id = message.get("id")
+                if call_id is not None and call_id >= _RELAY_ID_BASE:
+                    future = self.pending.pop(call_id, None)
+                    if future is not None and not future.done():
+                        future.set_result(message)
+                elif self.owner is not None:
+                    await self.owner._dispatch(message)
+        except websockets.ConnectionClosed:
+            log.info("cdp relay: Chrome closed the debugging socket")
+
+
 class CdpTabRelay:
     """Serve one tab of a running Chrome to one Playwright client."""
 
@@ -126,12 +188,9 @@ class CdpTabRelay:
         self._upstream_url = upstream_url
         self._profile = profile
         self._user_data_dir = user_data_dir or chrome_user_data_dir()
-        self._upstream: Any = None
+        self._link: _Link | None = None
         self._server: Any = None
         self._client: Any = None
-        self._reader: asyncio.Task[None] | None = None
-        self._ids = itertools.count(_RELAY_ID_BASE)
-        self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._client_methods: dict[int, str] = {}
         self._allowed: set[str] = set()
         self._sessions: set[str] = set()
@@ -142,13 +201,10 @@ class CdpTabRelay:
 
     async def start(self) -> str:
         """Open the tab and the local socket. Returns the URL for Playwright."""
-        try:
-            self._upstream = await websockets.connect(
-                self._upstream_url, max_size=None, open_timeout=_UPSTREAM_OPEN_TIMEOUT_S)
-        except Exception as err:  # noqa: BLE001 — one clear message for every connect failure
-            raise RelayError(f"Could not open Chrome's debugging socket at {self._upstream_url}: {err}") from err
-        self._reader = asyncio.create_task(self._read_upstream())
-        await self._call("Target.setDiscoverTargets", {"discover": True})
+        self._link = await _Link.get(self._upstream_url)
+        if self._link.owner is not None:
+            raise RelayError("Another relay is using this Chrome connection; runs share it one at a time.")
+        self._link.owner = self
         if self._profile:
             target_id = await self._open_in_profile()
         else:
@@ -161,29 +217,25 @@ class CdpTabRelay:
         return f"ws://127.0.0.1:{port}/devtools/browser/relay"
 
     async def close(self) -> None:
-        """Stop serving. The tab stays open, as the executor wants."""
+        """Stop serving and hand the shared connection back. The tab stays
+        open, as the executor wants; the client's sessions on it are detached
+        so the next relay starts clean."""
         if self._server is not None:
             self._server.close()
-        if self._reader is not None:
-            self._reader.cancel()
-        if self._upstream is not None:
-            await self._upstream.close()
+        if self._link is not None and self._link.owner is self:
+            for session in list(self._sessions):
+                try:
+                    await self._link.call("Target.detachFromTarget", {"sessionId": session})
+                except (RelayError, asyncio.TimeoutError, websockets.ConnectionClosed):
+                    pass
+            self._link.owner = None
 
     # ---- upstream --------------------------------------------------------
 
     async def _call(self, method: str, params: dict[str, Any] | None = None,
                     session: str | None = None) -> dict[str, Any]:
-        call_id = next(self._ids)
-        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._pending[call_id] = future
-        message: dict[str, Any] = {"id": call_id, "method": method, "params": params or {}}
-        if session:
-            message["sessionId"] = session
-        await self._upstream.send(json.dumps(message))
-        reply = await asyncio.wait_for(future, _CALL_TIMEOUT_S)
-        if "error" in reply:
-            raise RelayError(f"{method} failed: {reply['error'].get('message')}")
-        return reply.get("result", {})
+        assert self._link is not None
+        return await self._link.call(method, params, session)
 
     async def _open_in_profile(self) -> str:
         """Open the agent's tab in the named profile and return its target id.
@@ -213,20 +265,9 @@ class CdpTabRelay:
                 except asyncio.TimeoutError:
                     launcher.kill()
 
-    async def _read_upstream(self) -> None:
-        try:
-            async for raw in self._upstream:
-                await self._dispatch(json.loads(raw))
-        except websockets.ConnectionClosed:
-            log.info("cdp relay: Chrome closed the debugging socket")
-
     async def _dispatch(self, message: dict[str, Any]) -> None:
-        call_id = message.get("id")
-        if call_id is not None and call_id >= _RELAY_ID_BASE:
-            future = self._pending.pop(call_id, None)
-            if future is not None and not future.done():
-                future.set_result(message)
-        elif call_id is not None:
+        """A message from Chrome that is not a reply to the link's own calls."""
+        if message.get("id") is not None:
             await self._client_reply(message)
         else:
             await self._upstream_event(message)
@@ -315,7 +356,8 @@ class CdpTabRelay:
             return
         if call_id is not None:
             self._client_methods[call_id] = method
-        await self._upstream.send(json.dumps(message))
+        assert self._link is not None
+        await self._link.socket.send(json.dumps(message))
 
 
 # ---- Inline tests: `uv run python -m agent.executor.cdp_relay` -----------------------
@@ -388,6 +430,15 @@ async def _launch_throwaway_chrome(tmp: str, *, headless: bool = True) -> Any:
     raise RelayTestFailure("throwaway Chromium wrote no DevToolsActivePort")
 
 
+async def _all_titles(upstream: str) -> list[str]:
+    async with websockets.connect(upstream, max_size=None) as socket:
+        await socket.send(json.dumps({"id": 1, "method": "Target.getTargets"}))
+        while True:
+            reply = json.loads(await socket.recv())
+            if reply.get("id") == 1:
+                return [i["title"] for i in reply["result"]["targetInfos"] if i["type"] == "page"]
+
+
 async def _user_tab_titles(upstream: str) -> list[str]:
     async with websockets.connect(upstream, max_size=None) as socket:
         await socket.send(json.dumps({"id": 1, "method": "Target.getTargets"}))
@@ -453,6 +504,8 @@ async def _test_executor_through_relay() -> None:
                     raise RelayTestFailure("executor could not drive its relay tab")
             if await _user_tab_titles(devtools_ws_url(Path(tmp))) != ["user tab 1", "user tab 2"]:
                 raise RelayTestFailure("executor run changed the user's other tabs")
+            if "executor tab" in await _all_titles(devtools_ws_url(Path(tmp))):
+                raise RelayTestFailure("the run's tab was left open")
         finally:
             for key, value in saved.items():
                 if value is None:
@@ -463,8 +516,41 @@ async def _test_executor_through_relay() -> None:
             await process.wait()
 
 
+async def _test_relays_share_one_connection() -> None:
+    """End to end: two relays in a row, in one event loop, reuse one debugging
+    connection (one Chrome "Allow" prompt), and each still drives only its tab."""
+    import tempfile
+
+    from playwright.async_api import async_playwright
+
+    with tempfile.TemporaryDirectory() as tmp:
+        process = await _launch_throwaway_chrome(tmp)
+        try:
+            upstream = devtools_ws_url(Path(tmp))
+            links = set()
+            async with async_playwright() as pw:
+                for title in ("first run", "second run"):
+                    relay = CdpTabRelay(upstream, user_data_dir=Path(tmp))
+                    browser = await pw.chromium.connect_over_cdp(await relay.start(), timeout=20_000)
+                    links.add(id(relay._link))
+                    pages = [p for c in browser.contexts for p in c.pages]
+                    if len(pages) != 1:
+                        raise RelayTestFailure(f"{title}: client saw {len(pages)} tabs")
+                    await pages[0].goto(f"data:text/html,<title>{title}</title>")
+                    if await pages[0].title() != title:
+                        raise RelayTestFailure(f"{title}: could not drive its tab")
+                    await browser.close()
+                    await relay.close()
+            if len(links) != 1:
+                raise RelayTestFailure(f"relays opened {len(links)} connections, wanted 1")
+        finally:
+            process.kill()
+            await process.wait()
+
+
 if __name__ == "__main__":
     _test_config_resolution()
+    asyncio.run(_test_relays_share_one_connection())
     asyncio.run(_test_relay_shows_one_tab())
     asyncio.run(_test_executor_through_relay())
     print("cdp_relay.py inline tests passed")

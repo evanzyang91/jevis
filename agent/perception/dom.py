@@ -71,6 +71,7 @@ def _element_from(payload: dict) -> Element:
         context=payload.get("context"),
         opens=payload.get("opens"),
         visible=payload.get("visible"),
+        group=payload.get("group"),
         options=tuple(
             SelectOption(
                 label=option.get("label", ""),
@@ -174,6 +175,7 @@ async def observe(page: Page, *, include_text: bool = True) -> Observation:
         scroll_point=_point(state.get("scroll_point")),
         scroll_step=int(state["scroll_step"]) if state.get("scroll_step") else None,
         dialog_text=state.get("dialog_text") or None,
+        dialog_status=state.get("dialog_status") or None,
         hydration_retries=int(state.get("_retries", 0)),
     )
 
@@ -345,10 +347,128 @@ async def _e2e_page_scroll() -> None:
         raise ScrollTestFailure(f"page did not scroll: {before.scroll_y} -> {after.scroll_y}")
 
 
+# A dialog whose sticky title covers the top of its scroller, with Escape wired
+# to close it (as DoorDash does). The radio starts half under the title.
+_STICKY_DIALOG = """<!doctype html><html><body style="margin:0;overflow:hidden">
+<div id="dlg" role="dialog" aria-modal="true" style="position:fixed;left:300px;top:40px;width:500px;background:#fff">
+  <div id="sc" style="height:300px;overflow:auto;position:relative">
+    <div style="position:sticky;top:0;height:50px;background:#eee;z-index:2">Burrito Bowl</div>
+    <div style="height:200px"></div>
+    <label style="display:block;height:40px"><input type="radio" name="p" id="r"> Beef Barbacoa</label>
+    <div style="height:600px"></div>
+  </div>
+</div>
+<script>
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('dlg').remove(); });
+  const sc = document.getElementById('sc'); sc.scrollTop = 215;  // radio now under the sticky title
+</script></body></html>"""
+
+
+async def _e2e_modal_click_no_escape() -> None:
+    """End to end: a click on a dialog option hidden under the dialog's sticky
+    title scrolls it into view instead of pressing Escape, so the dialog stays
+    open and the option is chosen."""
+    import os
+
+    from agent.executor import Action, PlaywrightExecutor
+
+    for key in ("AGENT_CDP_URL", "AGENT_CHROME_PROFILE", "AGENT_CHROME_CHANNEL"):
+        os.environ.pop(key, None)
+    os.environ["AGENT_PROFILE_DIR"] = "none"
+    async with PlaywrightExecutor(headless=True) as executor:
+        page = executor.page
+        await page.set_content(_STICKY_DIALOG)
+        await page.evaluate("document.getElementById('r').setAttribute('data-agent-ref', 'e0')")
+        await executor.act(Action(id="click:e0", kind="click", label="Beef Barbacoa",
+                                  locator="[data-agent-ref=e0]", role="radio"))
+        still_open = await page.evaluate("!!document.getElementById('dlg')")
+        chosen = await page.evaluate("!!(document.getElementById('r') || {}).checked")
+    if not still_open:
+        raise ScrollTestFailure("clicking a covered dialog option closed the dialog")
+    if not chosen:
+        raise ScrollTestFailure("covered dialog option was not chosen")
+
+
+# A dialog whose Close button sits under a transparent overlay layer, as on
+# DoorDash's "Hungry now? View similar stores" dialog. Escape closes it.
+_COVERED_CLOSE = """<!doctype html><html><body style="margin:0">
+<div id="dlg" role="dialog" aria-modal="true"
+     style="position:fixed;left:300px;top:40px;width:500px;height:300px;background:#fff">
+  <button id="x" aria-label="Close" style="margin:10px">x</button><p>Hungry now? View similar stores</p>
+</div>
+<div style="position:fixed;inset:0;z-index:5"></div>
+<script>
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('dlg').remove(); });
+</script></body></html>"""
+
+
+async def _e2e_covered_close_dismisses() -> None:
+    """End to end: a covered "Close" inside a modal closes the dialog (Escape),
+    instead of failing as covered and leaving the run to wander."""
+    import os
+
+    from agent.executor import Action, PlaywrightExecutor
+
+    for key in ("AGENT_CDP_URL", "AGENT_CHROME_PROFILE", "AGENT_CHROME_CHANNEL"):
+        os.environ.pop(key, None)
+    os.environ["AGENT_PROFILE_DIR"] = "none"
+    async with PlaywrightExecutor(headless=True) as executor:
+        page = executor.page
+        await page.set_content(_COVERED_CLOSE)
+        await page.evaluate("document.getElementById('x').setAttribute('data-agent-ref', 'e0')")
+        await executor.act(Action(id="click:e0", kind="click", label="Close", locator="[data-agent-ref=e0]",
+                                  role="button"))
+        closed = await page.evaluate("!document.getElementById('dlg')")
+    if not closed:
+        raise ScrollTestFailure("covered Close did not close its dialog")
+
+
+_OPTION_DIALOG = """<!doctype html><html><body>
+<div role="dialog" aria-modal="true" style="position:fixed;left:200px;top:20px;width:500px;height:700px;overflow:auto">
+  <div><button>Rice Required • Select 1</button>
+    <div><label><input type="radio" id="w" checked> White Rice</label>
+         <label><input type="radio"> Brown Rice</label></div>
+  </div>
+  <div><button>Beans Required • Select 1</button>
+    <div><label><input type="radio" id="b"> Black Beans</label><label><input type="radio"> Pinto Beans</label></div>
+  </div>
+  <div><button>Toppings (Optional) • Select up to 3</button>
+    <div><label><input type="checkbox"> Queso +CA$2.15</label></div>
+  </div>
+  <button id="add">Make 1 required selection - CA$15.60</button>
+</div>
+<script>document.getElementById('b').addEventListener('change',
+  () => { document.getElementById('add').innerText = 'Add to cart - CA$15.60'; });</script>
+</body></html>"""
+
+
+async def _test_dialog_status() -> None:
+    """Unit: the reader reports which required groups lack a choice, and when the
+    add control is ready, across the whole dialog."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        await page.set_content(_OPTION_DIALOG)
+        before = (await observe(page)).dialog_status or {}
+        await page.click("#b")
+        after = (await observe(page)).dialog_status or {}
+        await browser.close()
+    if before.get("required_open") != ["Beans"] or before.get("required_done") != ["Rice"] or before.get("add_ready"):
+        raise ScrollTestFailure(f"dialog status before beans wrong: {before}")
+    ready = after.get("add_ready") and "Add to cart" in (after.get("add_control") or "")
+    if after.get("required_open") != [] or not ready:
+        raise ScrollTestFailure(f"dialog status after beans wrong: {after}")
+
+
 if __name__ == "__main__":
     import asyncio
 
+    asyncio.run(_test_dialog_status())
     asyncio.run(_unit_tests())
+    asyncio.run(_e2e_modal_click_no_escape())
+    asyncio.run(_e2e_covered_close_dismisses())
     asyncio.run(_e2e_dialog_scroll())
     asyncio.run(_e2e_page_scroll())
     print("dom.py inline scroll tests passed")

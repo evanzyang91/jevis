@@ -11,6 +11,7 @@ a target the policy did not tie to a real element.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -25,6 +26,16 @@ TEXT_ROLES = frozenset({"textbox", "searchbox", "combobox", "spinbutton"})
 SELECT_ROLE = "select"
 
 SCROLL_STEP = 700  # pixels per scroll action
+
+# A submit button that reports unmet requirements ("Make 1 required selection -
+# CA$16.55"). Clicking it never meets them: on DoorDash it jumps the dialog back
+# to its top, away from the missing group. It stays in the page text, so the
+# policy still knows a choice is missing; it is just not offered as a click.
+REQUIREMENT_STATUS = re.compile(r"\b\d+\s+required\s+selections?\b", re.I)
+# An option group's heading ("Beans Required • Select 1", "Toppings (Optional) •
+# Select up to 11"). It only opens or closes its group; runs clicked it instead
+# of an option even with a prompt rule against it.
+GROUP_HEADING = re.compile(r"\b(required|optional)\b.*\bselect\b", re.I)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +142,8 @@ def build(observation: Observation) -> ActionSpace:
     select_targets: list[Target] = []
     for index, element in enumerate(observation.elements):
         if element.role in CLICKABLE_ROLES:
+            if REQUIREMENT_STATUS.search(element.name or "") or GROUP_HEADING.search(element.name or ""):
+                continue
             click_targets.append(_click_target(index, element))
         elif element.role in TEXT_ROLES and element.editable:
             type_targets.append(_type_target(index, element))

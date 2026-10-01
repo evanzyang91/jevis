@@ -15,7 +15,8 @@ Always act on the first unfinished requirement; never revisit a finished one.
 In priority order:
 1. Dismiss any cookie banner, popup, or dialog covering the page (prefer accept/close), unless
    `page.dialog` is "task". A task dialog holds what the goal needs, such as the item's options:
-   never close it. Choose its options, SCROLL inside it, then use its add or confirm control.
+   never close it. Choose its options, SCROLL inside it, then use its add or confirm control once
+   that control no longer reports a missing selection.
 2. If a typed query sits in a search field, CLICK its matching suggestion or the Search
    button, or choose ENTER when neither exists — many searches submit only on Enter.
    Retyping or clearing that query is never progress.
@@ -23,7 +24,22 @@ In priority order:
    filter or control without re-toggling one already correct.
    A control that names an unmet requirement, such as "Make 2 required selections", is not the
    submit control: it reports what is missing. Choose the missing options instead, and SCROLL
-   inside the panel to reach the option groups below.
+   inside the panel to reach the option groups below. A group heading such as "Beans Required •
+   Select 1" only opens or closes its group: never click it. Choose an option listed under it; when
+   no option of that group is shown, SCROLL down inside the dialog. When the goal names no choice for
+   a required group, choose its first regular option, not a "No ..." option. An option whose
+   `checked` is true is already chosen, even when its label changed: never click it again. A
+   "Select 1" group is done once one of its options is checked: never choose another option in it
+   unless the goal names that option. Move on to the next unfinished group.
+   When the goal names an option (a filling, a protein, a size) that the page text shows but no
+   offered control does, it is below the fold: SCROLL to it. Never choose a different option in
+   its place. Build the item from its required options: never choose a paid extra (an option with
+   "+$") or a ready-made combo ("#1 • Ordered recently ...") that the goal did not ask for.
+   When `page.dialog_status` is present, it is the item's state: choose an option in each group in
+   `required_open` (SCROLL inside the dialog to reach it). When `add_ready` is true and the goal's
+   named options are chosen, use the add control (`add_control`) now and choose nothing else.
+   Keep the quantity at 1 unless the goal asks for more than one of the same item. A number in an
+   item's own name, such as "Three Tacos", is part of the item, not a quantity.
    For several of one item, set a quantity in one action — TYPE_TEXT or SELECT it. If the list
    offers only a single-unit control such as "add one to cart", open the item first and set the
    quantity there. Repeating a single-unit action many times is slow and overshoots.
@@ -38,6 +54,10 @@ In priority order:
    page, or a page reached by a wrong click. BACK undoes work, so never choose it right after
    an action that advanced the goal, and not before SCROLL or WAIT have been tried here.
 Never repeat an action whose page_changed was false; choose a different operation or target.
+Never choose a control that leads to checkout or payment: "Checkout", "Continue" or "Go to checkout"
+in a cart, "Place order", "Pay". The goal ends at the cart.
+If `guidance` is present, follow it: a stronger model wrote it after reading this page. Ignore it
+only when the page shows that its step is already done.
 DONE needs visible evidence for ALL requirements — stated counts and lists must match exactly,
 and a matching link is not enough when asked to open a result. BLOCKED means no supported
 operation can make progress; before it, check you have seen the content: if every visible
@@ -127,6 +147,32 @@ STEP_CHECK = {
         "page_changed was false does not advance it."
     ),
 }
+
+REINSTRUCT = """A small policy model chooses browser actions for the goal, one step at a time. It is stuck or
+unsure. Read the goal, the page text, the open dialog, the controls on screen, and the recent actions.
+Write the instruction for its next one to three steps.
+Rules:
+- Name the exact control to use by its visible label, or name the operation: scroll, back, close.
+  Name only controls listed in `controls`. When the option you need is not listed, it is off screen:
+  first say to scroll down inside the dialog (or the page) to reach it, then say to choose it.
+- The goal can name something the page does not offer by that name. Then find where it lives: it can
+  be an option inside a base item (a size, a flavour, a filling, a protein, a variant). Say which item
+  to open and which option to choose in it.
+- When a dialog shows an item's options, choose every required option in it before its add control.
+  Scroll inside the dialog to reach options below its fold. Name the exact option to choose, not its
+  group heading. When the goal names no choice for a required group, name its first regular option
+  (not a "No ..." option).
+- When recent actions repeat without progress, name a different approach.
+- A request such as "chips and guacamole" is one item when the menu has an item with that name: never
+  split it into separate items.
+- When a search found nothing, do not search again with other words. Open the control on screen that
+  best matches the base item (for "barbacoa bowl": a bowl) and look for the variant in its options.
+- Never sign in, create an account, check out, pay, or place an order.
+- At most 40 words. One instruction per sentence. Active voice.
+Return a JSON object only: {"guidance": "the instruction", "evidence": ["1 to 3 short phrases copied
+exactly from the page text or the controls, which the instruction relies on"], "control": "the exact
+label, copied from `controls` without its role, of the one control to use next, or null when the next
+step is a scroll, back, or wait"}."""
 
 CLASSIFY = """Choose the category that best matches the user goal.
 Read the goal and the site address. Choose the closest fit."""

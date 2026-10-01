@@ -118,8 +118,11 @@ async def _drive(goal: str, url: str, timeout_s: float, captcha_grace_s: float) 
                                           "escalate": event.escalate})
                 if event.check:
                     print(f"        check {event.check} (best {event.check_p:.2f}, signal {event.signal:.2f})"
-                          + (f" would switch to {event.check_switch!r}" if event.check_switch else "")
+                          + ((" SWITCHED to " if event.switched else " would switch to ") + repr(event.check_switch)
+                             if event.check_switch else "")
                           + ("  -> ESCALATE" if event.escalate else ""), flush=True)
+                if event.guidance:
+                    print(f"        hint: {event.guidance}", flush=True)
             elif isinstance(event, ActionEvent):
                 seen["actions"].append({"kind": event.action_kind, "label": event.target_label,
                                         "text": event.text})
@@ -168,11 +171,17 @@ def _check(seen: dict) -> list[E2EFailure]:
 
 def run_case(goal: str, url: str = "") -> int:
     """Run one goal end to end, print the verdict, and return the exit code."""
+    return asyncio.run(run_case_async(goal, url))
+
+
+async def run_case_async(goal: str, url: str = "") -> int:
+    """`run_case` inside a running event loop, so a suite's cases share one
+    Chrome debugging connection (one "Allow" prompt for the whole suite)."""
     load_dotenv()
     timeout_s = float(os.environ.get("E2E_TIMEOUT_S", "900"))
     grace_s = float(os.environ.get("E2E_CAPTCHA_GRACE_S", "90"))
     started = time.monotonic()
-    seen = asyncio.run(_drive(goal, url, timeout_s, grace_s))
+    seen = await _drive(goal, url, timeout_s, grace_s)
     failures = _check(seen)
     ms = [d["ms"] for d in seen["decisions"]]
     summary = {

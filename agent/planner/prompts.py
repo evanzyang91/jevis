@@ -14,6 +14,13 @@ Rules:
   on every decision.
 - On a store, name each item as a short search term plus the qualifying product; run a separate
   search for each item.
+- Search for the base item only. A filling, protein, size, flavour, or other variant the user names
+  is usually an option inside the base item, not a separate product: write it as an option to choose
+  after opening the item. For "a barbacoa bowl": search "bowl", open the bowl, choose barbacoa.
+- A count that matches a menu item's own name names that item, not a quantity: "three tacos" is
+  one "Three Tacos". Ask for one of anything unless the user asked for several.
+- A request such as "chips and guacamole" names one item when a store sells it under that name:
+  keep it as one item, never two.
 - Turn a vague multi-item request into concrete items (choose sensible specifics), then list every
   chosen item as its own sentence in `goal`. For "party stuff" that means naming the categories
   the user probably wants (decorations, plates, cups, and so on), each as one sentence.

@@ -146,10 +146,30 @@
     return raw.slice(0, 200);
   };
 
+  // A radio's group: its `name`, else the nearest ancestor holding several
+  // radios (DoorDash leaves `name` empty). One choice per group, so the policy
+  // can tell a finished group from an open one.
+  const RADIOS = 'input[type="radio"], [role="radio"]';
+  const groupIds = new Map();
+  const groupOf = (el) => {
+    if (el.name) return "name:" + el.name;
+    for (let n = el.parentElement; n && n !== document.body; n = n.parentElement) {
+      if (n.querySelectorAll(RADIOS).length >= 2) {
+        if (!groupIds.has(n)) groupIds.set(n, "g" + groupIds.size);
+        return groupIds.get(n);
+      }
+    }
+    return null;
+  };
+
   const stateOf = (el, role) => {
     const state = {};
     if (role === "checkbox" || role === "radio" || role === "switch") {
       state.checked = el.checked === true || el.getAttribute("aria-checked") === "true";
+    }
+    if (role === "radio") {
+      const group = groupOf(el);
+      if (group) state.group = group;
     }
     if (role === "option" || role === "tab" || role === "menuitem") {
       state.selected = el.getAttribute("aria-selected") === "true";
@@ -319,6 +339,55 @@
     elements.push(snapshot);
   }
 
+  // ---- Dialog status ----------------------------------------------------
+  // For an open modal's option groups, across the whole dialog (below its fold
+  // too): which required groups still lack a choice, and whether the add
+  // control is ready. Facts code can see, so the policy need not infer "this
+  // item is complete" from a few visible buttons.
+  const HEADING = /\b(required|optional)\b[^\n]{0,40}\bselect\b/i;
+  // Each radio group's heading: the last heading above it in document order.
+  // Headings precede their options in option menus, whatever the nesting.
+  const headingsByGroup = (root) => {
+    const found = new Map();
+    let current = null;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    for (let n = walker.currentNode; n; n = walker.nextNode()) {
+      if (n.matches(RADIOS)) {
+        const key = groupOf(n);
+        if (key && !found.has(key)) found.set(key, current);
+      } else if (n.matches("button, h1, h2, h3, h4, h5, legend, [role=heading]") && !n.querySelector(RADIOS)) {
+        const text = (n.innerText || n.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+        if (HEADING.test(text)) current = text;
+      }
+    }
+    return found;
+  };
+  let dialogStatus = null;
+  if (modal) {
+    const groups = new Map();
+    for (const radio of modal.querySelectorAll(RADIOS)) {
+      const key = groupOf(radio);
+      if (!key) continue;
+      const g = groups.get(key) || { checked: false };
+      if (radio.checked === true || radio.getAttribute("aria-checked") === "true") g.checked = true;
+      groups.set(key, g);
+    }
+    const open = [];
+    const done = [];
+    const headings = headingsByGroup(modal);
+    for (const [key, g] of groups) {
+      const heading = headings.get(key);
+      if (!heading || !/\brequired\b/i.test(heading)) continue;
+      const name = heading.split(/\brequired\b/i)[0].trim() || heading;
+      (g.checked ? done : open).push(name);
+    }
+    const adds = [...modal.querySelectorAll("button")].map((b) => (b.innerText || b.getAttribute("aria-label") || "").trim());
+    const ready = adds.find((t) => /^add (item )?to (cart|order)\b/i.test(t) && !/required|loading/i.test(t));
+    if (groups.size || ready) {
+      dialogStatus = { required_open: open, required_done: done, add_ready: !!ready, add_control: ready || null };
+    }
+  }
+
   const markerParts = [
     location.href,
     scrollX, scrollY, innerWidth, innerHeight,
@@ -359,9 +428,10 @@
     can_scroll_up: scrollTop > 4,
     can_scroll_down: canScrollDown,
     scroll_area: scrollArea,
+    dialog_status: dialogStatus,
     // The open modal's own text, for judging what the dialog is. The page
     // text above also holds everything behind it.
-    dialog_text: modal ? (modal.innerText || "").replace(/\s+/g, " ").trim().slice(0, 1500) : null,
+    dialog_text: modal ? (modal.innerText || "").replace(/\s+/g, " ").trim().slice(0, 4000) : null,
     // Only for a dialog or panel. The page keeps the executor's fixed wheel
     // point, which Walmart's hover-sensitive tiles were tuned against.
     scroll_point: scroller && scrollBox.w > 0 && scrollBox.h > 0

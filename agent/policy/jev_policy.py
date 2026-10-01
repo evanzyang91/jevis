@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from typing import Any
 
 from agent.perception import Observation
@@ -28,10 +29,60 @@ CHECK_TRIGGER = 0.5
 CHECK_TERMINAL = 0.8
 CHECK_PASS = 0.7
 CHECK_CANDIDATES = 3
+# Act on the check's best candidate when it clears and is not the policy's pick
+# ("open X" -> "Add to cart - X"). Only within the same operation's targets, or
+# to an operation with no target: an operation alone names no element to click.
+CHECK_SWITCH = True
 # Route words that do not change which item a control acts on: "Eggs" and
 # "Add to cart - Eggs" are one decision. A favourites or sign-in control is not.
 _ROUTE_PREFIX = re.compile(r"^(add to cart|add item to cart|add to order|loading)\b\s*-?\s*", re.I)
 _TRAILING_PRICE = re.compile(r"\s*(ca)?\$[\d.,]+$", re.I)
+# Quantity controls ("Current quantity is 1", "Increase quantity by 1"), and the
+# words that ask for more than one of an item. Without such words a quantity
+# control can only overshoot: one live run typed into it and ordered three.
+_QUANTITY_CONTROL = re.compile(r"\bquantity\b", re.I)
+# An option label's details after its name: " VG 210 cal", " +CA$0.95", " 150 cal".
+_OPTION_DETAILS = re.compile(r"\s(?:VG|VT|GF)\b|\s\+|\s\d", re.I)
+NAME_MATCH = 0.85
+
+
+def option_core(label: str) -> str:
+    """An option's own name: "Brown Rice VG 210 cal Brown Rice" -> "brown rice"."""
+    return _OPTION_DETAILS.split(label.strip(), maxsplit=1)[0].strip().lower()
+
+
+def goal_names(goal: str, label: str) -> bool:
+    """Whether the goal names this option, loosely: "pinto bean" names "Pinto
+    Beans", "brown-rice" names "Brown Rice", "white rice" does not."""
+    core = option_core(label)
+    if not core:
+        return False
+    words = re.sub(r"[^a-z0-9 ]+", " ", goal.lower()).split()
+    if core in " ".join(words):
+        return True
+    size = len(core.split())
+    return any(SequenceMatcher(None, " ".join(words[i:i + size]), core).ratio() >= NAME_MATCH
+               for i in range(max(0, len(words) - size + 1)))
+
+
+def settled_options(observation: Observation, goal: str) -> set[str]:
+    """Option labels not to offer: a radio already chosen, and the other radios
+    of a group that already has a choice, unless the goal names that option.
+    Prompt rules alone left runs re-choosing inside finished groups (Brown Rice
+    chosen, then White Rice at 0.54, below the step check's reach)."""
+    radios = [e for e in observation.elements if e.role == "radio"]
+    finished = {e.group for e in radios if e.checked and e.group}
+    return {e.name for e in radios
+            if e.checked or (e.group in finished and not goal_names(goal, e.name))}
+
+
+# Controls whose only job is to close a dialog (the executor uses the same rule).
+_CLOSE_CONTROL = re.compile(r"^\s*(close|dismiss|cancel|no,? thanks|not now|×|x)\b", re.I)
+
+
+# A count followed by a capitalised word is part of an item's name ("Three Tacos").
+_ASKS_SEVERAL = re.compile(r"\b(?i:[2-9]|[1-9]\d+|two|three|four|five|six|seven|eight|nine|ten|dozen|several|"
+                           r"pair|couple)\b(?!\s+[A-Z])")
 
 
 def _operations_for(element) -> list[str]:  # noqa: ANN001
@@ -121,10 +172,12 @@ class Decision:
     signal: float = 1.0
     # The step check, when it ran: "cleared" or "failed". `check_p` is the best
     # candidate's score; `check_switch` names it when it is not the policy's pick.
-    # Log-only: the action above is always the policy's own pick.
+    # With CHECK_SWITCH on, a cleared check may replace the policy's pick.
     check: str | None = None
     check_p: float = 0.0
     check_switch: str | None = None
+    # True when the action above is the check's candidate, not the policy's pick.
+    switched: bool = False
 
 
 def _reduced(space: ActionSpace, keep: int) -> ActionSpace:
@@ -191,12 +244,24 @@ async def decide(
     goal: str,
     history: list[dict[str, Any]],
     banned: Iterable[str] = (),
+    guidance: str | None = None,
+    hint_control: str | None = None,
 ) -> Decision:
     """Ask Jev for the next operation and target. Retries with a shrunken
     action space when the server reports the request oversized."""
     space = build(observation)
+    banned = {*banned, *settled_options(observation, goal)}
+    if not _ASKS_SEVERAL.search(goal):
+        banned = {*banned, *(element.name for element in observation.elements
+                             if _QUANTITY_CONTROL.search(element.name or ""))}
     diagnosis = await diagnose_dialog(client=client, observation=observation, goal=goal)
     dialog = diagnosis[0] if diagnosis and diagnosis[1] >= DIALOG_KIND_MIN else None
+    if dialog == "task" and not (hint_control and _CLOSE_CONTROL.match(hint_control)):
+        # A task dialog holds what the goal needs; with its finished options
+        # withheld, "Close" was the policy's pick at 0.55 and lost every choice.
+        # Only a hint that names the close control (a wrong item) may close it.
+        banned = {*banned, *(element.name for element in observation.elements
+                             if _CLOSE_CONTROL.match(element.name or ""))}
     attempts = 0
     max_targets = MAX_ACTION_SPACE
     while True:
@@ -219,7 +284,12 @@ async def decide(
             "page": {
                 "url": observation.url,
                 "title": observation.title,
-                "text": observation.text[:1500 if attempts > 1 else 6000],
+                # While a modal is open the page behind it is inert, and its text
+                # fills the 6000 characters before the dialog's own text begins
+                # (DoorDash: all navigation). The dialog's headings say which
+                # option groups are required, so they are what the policy reads.
+                "text": (observation.dialog_text if observation.scroll_area == "dialog" and observation.dialog_text
+                         else observation.text)[:1500 if attempts > 1 else 6000],
                 # Loading flag is advisory — lets the policy pick Wait when the
                 # page is mid-load rather than betting on a stale action.
                 "loading": observation.loading,
@@ -228,6 +298,9 @@ async def decide(
                 **({"scroll_area": observation.scroll_area} if observation.scroll_area != "page" else {}),
                 # What the open dialog is, so rule 1 closes only interruptions.
                 **({"dialog": dialog} if dialog else {}),
+                # Which required option groups still lack a choice, and whether
+                # the add control is ready (computed by the reader, not inferred).
+                **({"dialog_status": observation.dialog_status} if observation.dialog_status else {}),
             },
             "elements": [
                 _element_state(idx, element) for idx, element in enumerate(observation.elements)
@@ -237,6 +310,9 @@ async def decide(
             # completed items on multi-step goals and the policy restarts them.
             "recent_actions": _progress(history),
         }
+        if guidance:
+            # A text model's hint for this step (see policy/reinstruct.py).
+            state["guidance"] = guidance
         try:
             result = await client.ask(state=state, questions=questions)
             break
@@ -256,11 +332,6 @@ async def decide(
             raise RuntimeError(f"Missing target head for operation {operation}")
         target = target_answer.choice
         probabilities = target_answer.probabilities
-    action = resolve(space, operation, target)
-    if action is not None and action.kind == "scroll" and observation.scroll_point is not None:
-        # Move the open dialog or panel, by most of its own height.
-        step = observation.scroll_step or abs(action.delta)
-        action = replace(action, point=observation.scroll_point, delta=step if action.delta > 0 else -step)
     offered: dict[str, tuple[str, ...]] = {}
     banned_set = set(banned)
     for op in space.operations:
@@ -274,23 +345,72 @@ async def decide(
             offered[op.id] = surviving
     # Candidates as the check reads them: the policy's pick first, then the
     # next most likely, from whichever head decided this step.
+    # Ids travel with labels: a page can hold several controls with one label.
+    labels: dict[str, str] = {}
     if target is not None:
         labels = {t.id: t.label for t in space.by_id(operation).targets}
         ranked = sorted(probabilities.items(), key=lambda item: -item[1])
-        candidates = [(labels.get(key, key), p) for key, p in ranked]
-        chosen_label = labels.get(target, target)
+        keyed = [(key, labels.get(key, key), p) for key, p in ranked]
+        chosen_key, chosen_label = target, labels.get(target, target)
     else:
         op_labels = {op.id: op.label for op in space.operations}
         ranked = sorted(operation_answer.probabilities.items(), key=lambda item: -item[1])
-        candidates = [(f"{key}: {op_labels.get(key, key)}", p) for key, p in ranked]
-        chosen_label = f"{operation}: {op_labels.get(operation, operation)}"
+        keyed = [(key, f"{key}: {op_labels.get(key, key)}", p) for key, p in ranked]
+        # The check may only clear what can be done: "CLICK" alone names no
+        # element. A best idea of "click something" means the policy does not
+        # know what to click, so the step must fail and escalate.
+        executable = [entry for entry in keyed if not space.by_id(entry[0]).targets]
+        chosen_key, chosen_label = operation, f"{operation}: {op_labels.get(operation, operation)}"
+    candidates = [(label, p) for _, label, p in keyed]
     signal = grouped_signal(operation_answer.confidence, chosen_label if target else None, candidates)
     check = None
-    if signal < CHECK_TRIGGER or (operation in {"DONE", "BLOCKED"} and signal < CHECK_TERMINAL):
-        shortlist = [chosen_label] + [label for label, _ in candidates if label != chosen_label]
+    switched = False
+    terminal = operation in {"DONE", "BLOCKED"}
+    if target is None and not terminal and signal < CHECK_TRIGGER:
+        # Unsure between kinds of action (scroll, wait, back...): the check has
+        # nothing concrete to judge. Each scroll of a loop looks reasonable alone
+        # (0.69-0.73 in the 2026-10-01 replay), so it counts as failed, with no
+        # call; the streak in should_escalate keeps a one-off WAIT from escalating.
+        check = StepCheck(verdict="failed", best_p=0.0, switch=None, scores=(), usage={})
+    elif signal < CHECK_TRIGGER or (terminal and signal < CHECK_TERMINAL):
+        pool = keyed if target is not None else executable
+        shortlist = ([(chosen_key, chosen_label)]
+                     + [(key, label) for key, label, _ in pool if key != chosen_key])[:CHECK_CANDIDATES]
+        screen = None
+        if terminal:
+            screen = {"text": state["page"]["text"][:2000],
+                      "controls": [element.name for element in observation.elements][:60]}
         check = await check_step(client=client, goal=goal, page=state["page"],
                                  recent_actions=state["recent_actions"],
-                                 candidates=shortlist[:CHECK_CANDIDATES])
+                                 candidates=[label for _, label in shortlist], screen=screen)
+        if CHECK_SWITCH and check is not None and check.switch_index:
+            new_key = shortlist[check.switch_index][0]
+            if target is not None:
+                target, switched = new_key, True
+            else:
+                operation, switched = new_key, True  # the pool held only target-free operations
+    if hint_control:
+        # The hint named a control and the policy did not take it, while its own
+        # pick failed the check or stops the run. Take the named control, if it
+        # is offered and Jev's own check finds it reasonable: the text model
+        # still cannot invent an action.
+        chosen_now = labels.get(target, "") if target is not None else ""
+        unsure = (check is not None and check.verdict == "failed") or operation in {"DONE", "BLOCKED"}
+        if unsure and not _same_control(chosen_now, hint_control):
+            named = _offered_control(space, set(banned), hint_control)
+            if named is not None:
+                follow = await check_step(client=client, goal=goal, page=state["page"],
+                                          recent_actions=state["recent_actions"], candidates=[named[2]])
+                if follow is not None and follow.best_p >= CHECK_PASS:
+                    operation, target, switched = named[0], named[1], True
+                    check = StepCheck(verdict="cleared", best_p=follow.best_p, switch=named[2],
+                                      scores=follow.scores, usage=_usage_sum(check.usage if check else {},
+                                                                             follow.usage))
+    action = resolve(space, operation, target)
+    if action is not None and action.kind == "scroll" and observation.scroll_point is not None:
+        # Move the open dialog or panel, by most of its own height.
+        step = observation.scroll_step or abs(action.delta)
+        action = replace(action, point=observation.scroll_point, delta=step if action.delta > 0 else -step)
     return Decision(
         operation=operation,
         target=target,
@@ -307,12 +427,30 @@ async def decide(
         check=check.verdict if check else None,
         check_p=check.best_p if check else 0.0,
         check_switch=check.switch if check else None,
+        switched=switched,
     )
 
 
 def _item_of(label: str) -> str:
     """The item a control acts on, with route words and a trailing price removed."""
     return _TRAILING_PRICE.sub("", _ROUTE_PREFIX.sub("", label.strip())).strip().lower()
+
+
+def _same_control(a: str, b: str) -> bool:
+    a, b = a.strip().lower(), b.strip().lower()
+    return bool(a) and (a == b or a.startswith(b) or b.startswith(a)
+                        or SequenceMatcher(None, a, b).ratio() >= NAME_MATCH)
+
+
+def _offered_control(space: ActionSpace, banned: set[str], name: str) -> tuple[str, str, str] | None:
+    """(operation, target id, label) of the offered target that `name` names."""
+    for operation in space.operations:
+        for candidate in operation.targets:
+            if candidate.id in banned or candidate.label in banned:
+                continue
+            if _same_control(candidate.label, name):
+                return operation.id, candidate.id, candidate.label
+    return None
 
 
 def grouped_signal(op_confidence: float, chosen: str | None, candidates: list[tuple[str, float]]) -> float:
@@ -340,11 +478,13 @@ class StepCheck:
     switch: str | None
     scores: tuple[float, ...]
     usage: Mapping[str, int]
+    # Index of `switch` in the candidates, or None.
+    switch_index: int | None = None
 
 
 async def check_step(
     *, client: JevClient, goal: str, page: Mapping[str, Any], recent_actions: list[dict[str, Any]],
-    candidates: list[str],
+    candidates: list[str], screen: Mapping[str, Any] | None = None,
 ) -> StepCheck | None:
     """Ask Jev whether each candidate is a reasonable next step: one Noul each,
     in one request. A Choice is relative and says which option is best; a Noul
@@ -357,6 +497,10 @@ async def check_step(
         "recent_actions": recent_actions,
         "candidates": candidates,
     }
+    if screen:
+        # DONE and BLOCKED only: what is on screen now. "Add to cart" in the
+        # history is not proof; a cart badge reading 0 items is proof against.
+        state["screen"] = dict(screen)
     questions = {
         f"c{j}": {"type": "noul", "instructions": {
             "question": STEP_CHECK["question"].replace("{candidate}", f"`candidates[{j}]`"),
@@ -376,6 +520,7 @@ async def check_step(
         switch=candidates[best] if passed and best != 0 else None,
         scores=scores,
         usage=dict(result.usage),
+        switch_index=best if passed and best != 0 else None,
     )
 
 
@@ -537,12 +682,14 @@ class _SplitJev:
     def __init__(self, op_conf: float, target_probs: list[float], check_scores: list[float]) -> None:
         self.op_conf, self.target_probs, self.check_scores = op_conf, target_probs, check_scores
         self.checks = 0
+        self.checked: list[str] = []
 
     async def ask(self, *, state: dict[str, Any], questions: dict[str, Any]):  # noqa: ANN201
         from agent.providers import ChoiceAnswer, JevResult, NoulAnswer
 
         if "c0" in questions:
             self.checks += 1
+            self.checked = list(state["candidates"])
             nouls = {f"c{j}": NoulAnswer(noul=v) for j, v in enumerate(self.check_scores)}
             return JevResult(answers={}, model="stand-in", usage={"input_tokens": 50}, latency_ms=0, nouls=nouls)
         ops = questions["operation"]["criteria"]
@@ -554,6 +701,97 @@ class _SplitJev:
         tgt = ChoiceAnswer(choice=max(probs, key=probs.get), probabilities=probs, confidence=max(probs.values()))
         return JevResult(answers={"operation": op, "click_target": tgt}, model="stand-in",
                          usage={"input_tokens": 1000}, latency_ms=0)
+
+
+class _OpJev(_SplitJev):
+    """Picks SCROLL_DOWN unsurely (0.40, CLICK 0.35); the check prefers CLICK."""
+
+    def __init__(self) -> None:
+        super().__init__(0.4, [1.0, 0.0, 0.0], [0.1, 0.9, 0.2])
+
+    async def ask(self, *, state: dict[str, Any], questions: dict[str, Any]):  # noqa: ANN201
+        from agent.providers import ChoiceAnswer, JevResult
+
+        if "c0" in questions:
+            return await super().ask(state=state, questions=questions)
+        ops = list(questions["operation"]["criteria"])
+        probs = {k: 0.40 if k == "SCROLL_DOWN" else 0.35 if k == "CLICK" else 0.25 / (len(ops) - 2) for k in ops}
+        op = ChoiceAnswer(choice="SCROLL_DOWN", probabilities=probs, confidence=0.40)
+        return JevResult(answers={"operation": op}, model="stand-in", usage={}, latency_ms=0)
+
+
+class _HintJev(_SplitJev):
+    """Policy unsure between three sugar controls (picks the favourites one); the
+    check scores every candidate low except "Add to cart"."""
+
+    async def ask(self, *, state: dict[str, Any], questions: dict[str, Any]):  # noqa: ANN201
+        from agent.providers import JevResult, NoulAnswer
+
+        if "c0" in questions:
+            self.checks += 1
+            nouls = {f"c{j}": NoulAnswer(noul=0.9 if c == _SUGAR[1] else 0.1)
+                     for j, c in enumerate(state["candidates"])}
+            return JevResult(answers={}, model="stand-in", usage={}, latency_ms=0, nouls=nouls)
+        return await super().ask(state=state, questions=questions)
+
+
+def _radio_page(checked: str | None) -> Observation:
+    from agent.perception import Element, Rect
+
+    names = ("White Rice VG 210 cal White Rice", "Brown Rice VG 210 cal Brown Rice", "No Rice 0 cal",
+             "Rice Required • Select 1")
+    elements = tuple(Element(ref=f"[data-agent-ref=e{i}]", role="button" if "Select" in n else "radio", name=n,
+                             bounds=Rect(500, 100 + 40 * i, 200, 30), checked=None if "Select" in n else n == checked,
+                             group=None if "Select" in n else "g0", section="dialog")
+                     for i, n in enumerate(names))
+    return replace(_sugar_page(), elements=elements, scroll_area="dialog", dialog_text="Rice Required • Select 1")
+
+
+async def _option_unit_tests() -> None:
+    """Units for the option guard, the fuzzy naming, the heading filter, and the hint's control."""
+    goal = "Open a bowl and choose sofritas, brown-rice, and pinto bean. Add one bowl."
+    # Fuzzy naming: small wording changes still name the option; other options do not.
+    named = {label: goal_names(goal, label) for label in ("Brown Rice VG 210 cal Brown Rice",
+             "Pinto Beans VG 130 cal Pinto Beans", "White Rice VG 210 cal White Rice", "No Beans 0 cal")}
+    if named != {"Brown Rice VG 210 cal Brown Rice": True, "Pinto Beans VG 130 cal Pinto Beans": True,
+                 "White Rice VG 210 cal White Rice": False, "No Beans 0 cal": False}:
+        raise CheckTestFailure(f"fuzzy naming wrong: {named}")
+    # Settled options: a chosen radio and its finished group are withheld, unless named.
+    settled = settled_options(_radio_page("White Rice VG 210 cal White Rice"), goal)
+    if settled != {"White Rice VG 210 cal White Rice", "No Rice 0 cal"}:
+        raise CheckTestFailure(f"settled options wrong (named Brown Rice must stay open): {settled}")
+    if settled_options(_radio_page(None), goal):
+        raise CheckTestFailure("an open group was withheld")
+    # Heading filter: an option group's heading is not a click target.
+    labels = [t.label for op in build(_radio_page(None)).operations for t in op.targets]
+    if "Rice Required • Select 1" in labels:
+        raise CheckTestFailure("group heading offered as a click")
+    # Task dialog: its close control is not offered, unless a hint names it.
+    closing = replace(_radio_page("White Rice VG 210 cal White Rice"), elements=(
+        *_radio_page("White Rice VG 210 cal White Rice").elements,
+        replace(_radio_page(None).elements[0], ref="[data-agent-ref=e9]", role="button", name="Close Salad",
+                checked=None, group=None)))
+
+    class _TaskJev(_StandIn):
+        async def ask(self, *, state: dict[str, Any], questions: dict[str, Any]):  # noqa: ANN201
+            if "operation" in questions:
+                self.offered = list(questions.get("click_target", {}).get("criteria", {}).values())
+            return await super().ask(state=state, questions=questions)
+
+    jev = _TaskJev("task", 0.9)
+    await decide(client=jev, observation=closing, goal=goal, history=[])  # type: ignore[arg-type]
+    if any("Close Salad" in str(c) for c in jev.offered):
+        raise CheckTestFailure("close control offered in a task dialog")
+    jev = _TaskJev("task", 0.9)
+    await decide(client=jev, observation=closing, goal=goal, history=[], hint_control="Close Salad")  # type: ignore[arg-type]
+    if not any("Close Salad" in str(c) for c in jev.offered):
+        raise CheckTestFailure("a hint naming the close control could not close")
+    # Hint control: the policy ignores the hint and fails its check; the named control is taken.
+    jev = _HintJev(0.9, [0.30, 0.25, 0.45], [])
+    decision = await decide(client=jev, observation=_sugar_page(), goal="Add one bag of sugar to the cart.",
+                            history=[], guidance="Click Add to cart.", hint_control=_SUGAR[1])  # type: ignore[arg-type]
+    if decision.action is None or decision.action.label != _SUGAR[1] or not decision.switched:
+        raise CheckTestFailure(f"hint control not taken: {decision.action.label if decision.action else None}")
 
 
 async def _check_unit_tests() -> None:
@@ -575,17 +813,31 @@ async def _check_unit_tests() -> None:
     decision = await decide(client=jev, observation=_sugar_page(), goal=goal, history=[])  # type: ignore[arg-type]
     if jev.checks != 1 or decision.check != "cleared" or decision.check_switch != _SUGAR[1]:
         raise CheckTestFailure(f"check not logged: {decision.check} {decision.check_switch}")
-    if decision.action is None or decision.action.label != _SUGAR[2]:
-        raise CheckTestFailure("log-only check changed the action")
+    if decision.action is None or decision.action.label != _SUGAR[1] or not decision.switched:
+        raise CheckTestFailure(f"switch not applied: {decision.action.label if decision.action else None}")
     if decision.usage.get("input_tokens") != 1050:
         raise CheckTestFailure(f"check tokens not counted: {decision.usage}")
+    cleared = decision
+    # Gap 4: unsure between kinds of action (here SCROLL_DOWN 0.40 vs CLICK 0.35)
+    # counts as a failed check with no Jev call, and the action stays the pick.
+    jev = _OpJev()
+    decision = await decide(client=jev, observation=_sugar_page(), goal=goal, history=[])  # type: ignore[arg-type]
+    if jev.checks or decision.check != "failed" or decision.switched or decision.operation != "SCROLL_DOWN":
+        raise CheckTestFailure(f"operation-level doubt wrong: calls={jev.checks} check={decision.check}")
+    # Gap 5: quantity controls stay offered only when the goal asks for several;
+    # a count inside an item's name ("Three Tacos") is not such a request.
+    for text, several in (("Add two bags of flour.", True), ("Add 3 cartons of milk.", True),
+                          ("Open Three Tacos and choose chicken.", False),
+                          ("Search chips and guacamole and add one to the cart.", False)):
+        if bool(_ASKS_SEVERAL.search(text)) != several:
+            raise CheckTestFailure(f"count detection wrong for {text!r}")
     # Gap 3: escalate on the second failure in a row, or at once for DONE/BLOCKED.
-    failed = replace(decision, check="failed")
+    failed = replace(cleared, check="failed")
     if should_escalate(failed, previous_check_failed=False) or not should_escalate(failed, True):
         raise CheckTestFailure("streak rule wrong")
     if not should_escalate(replace(failed, operation="DONE"), previous_check_failed=False):
         raise CheckTestFailure("failed DONE did not escalate at once")
-    if should_escalate(decision, previous_check_failed=True):
+    if should_escalate(cleared, previous_check_failed=True):
         raise CheckTestFailure("cleared check escalated")
 
 
@@ -605,19 +857,22 @@ async def _check_e2e_live() -> None:
           f"switch={sugar.switch if sugar else None!r}")
     if sugar is None or sugar.verdict != "cleared":
         raise CheckTestFailure("harmless split did not clear")
-    # End to end 2: the Chipotle scroll loop fails the check.
-    loop = await check_step(
+    # End to end 2: DONE after a plain bowl and a background "Add item to cart" (the
+    # first Chipotle run: no barbacoa was ever chosen) fails the check.
+    done = await check_step(
         client=client, goal=_GOAL,
         page={"url": "https://www.doordash.com/store/chipotle-waterloo-36154775/81102878/", "title": "Chipotle"},
-        recent_actions=[{"label": "Item Search", "page_changed": True}, {"label": "Press Enter", "page_changed": True},
-                        {"label": "Scroll down", "page_changed": True}, {"label": "Scroll up", "page_changed": True},
-                        {"label": "Scroll down", "page_changed": True}],
-        candidates=["SCROLL_DOWN: Reveal content below the viewport.",
-                    "CLICK: Click an element, button, menu option, or link.",
-                    "BLOCKED: No supported operation can advance the goal."])
-    print(f"live: chipotle loop -> {loop.verdict if loop else None} best={loop.best_p if loop else 0:.2f}")
-    if loop is None or loop.verdict != "failed":
-        raise CheckTestFailure("scroll loop passed the check")
+        recent_actions=[{"label": "Essential only", "page_changed": True},
+                        {"label": "Item Search", "page_changed": True},
+                        {"label": "Burrito Bowl CA$15.60", "page_changed": True},
+                        {"label": "Loading Add to cart - CA$15.60", "page_changed": False},
+                        {"label": "Add item to cart", "page_changed": True}],
+        candidates=["DONE: Every requirement is visibly satisfied.",
+                    "SCROLL_DOWN: Reveal content below the viewport.",
+                    "WAIT: Wait for a running request or animation to settle."])
+    print(f"live: chipotle wrong DONE -> {done.verdict if done else None} best={done.best_p if done else 0:.2f}")
+    if done is None or done.verdict != "failed":
+        raise CheckTestFailure("DONE without barbacoa passed the check")
 
 
 if __name__ == "__main__":
@@ -625,6 +880,7 @@ if __name__ == "__main__":
 
     asyncio.run(_unit_tests())
     asyncio.run(_check_unit_tests())
+    asyncio.run(_option_unit_tests())
     asyncio.run(_e2e_live())
     asyncio.run(_check_e2e_live())
     print("jev_policy.py inline dialog and step-check tests passed")

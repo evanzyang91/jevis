@@ -7,6 +7,7 @@ history and assert on the outcome without running a browser.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
@@ -248,3 +249,49 @@ def combined_ban(
         | set(repeated_label(history))
         | set(inert_labels(history))
     )
+
+
+# ---- Purchase guard ---------------------------------------------------------
+
+# A checkout or payment page. Reaching one is how money gets spent, and the
+# plan's "Do not place the order" is only a prompt: a generic "Continue" in a
+# DoorDash cart drawer led straight to /consumer/checkout/ (2026-10-01).
+PURCHASE_URL = re.compile(r"/(checkout|payment|pay|place-?order)(/|\?|$)", re.I)
+_ASKS_TO_BUY = re.compile(r"\b(check ?out|place the order|complete the purchase|pay)\b", re.I)
+_FORBIDS_BUYING = re.compile(r"\bdo not (place|submit|complete|check ?out|pay)\b", re.I)
+
+
+def purchase_allowed(goal: str) -> bool:
+    """Only a goal that asks to buy, and does not forbid it, may reach checkout."""
+    return bool(_ASKS_TO_BUY.search(goal)) and not _FORBIDS_BUYING.search(goal)
+
+
+def reached_purchase(url: str, goal: str) -> bool:
+    """True when an action landed on a checkout or payment page the goal forbids."""
+    return bool(PURCHASE_URL.search(url)) and not purchase_allowed(goal)
+
+
+# ---- Inline tests: `uv run python -m agent.supervisor.guards` ------------------------
+
+
+class GuardTestFailure(AssertionError):
+    """An inline guard test saw the wrong result."""
+
+
+def _test_purchase_guard() -> None:
+    """Unit: the checkout page a "Continue" reached is stopped; a goal that asks
+    to buy may proceed; a store page is never flagged."""
+    checkout = "https://www.doordash.com/consumer/checkout/?lat=43.47&order_cart_id=364a"
+    store = "https://www.doordash.com/store/chipotle-waterloo-36154775/81102878/"
+    plan = "Search 'salad'. Choose steak. Add the salad to the cart. Do not place the order."
+    if not reached_purchase(checkout, plan):
+        raise GuardTestFailure("checkout page not stopped for a do-not-order goal")
+    if reached_purchase(store, plan):
+        raise GuardTestFailure("store page flagged as a purchase")
+    if reached_purchase(checkout, "Add the salad to the cart, then check out and pay."):
+        raise GuardTestFailure("a goal that asks to buy was stopped")
+
+
+if __name__ == "__main__":
+    _test_purchase_guard()
+    print("guards.py inline tests passed")

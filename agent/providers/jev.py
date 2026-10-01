@@ -7,6 +7,7 @@ anyway: a wrong probability distribution is not an action either.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
@@ -16,6 +17,8 @@ from typing import Any
 import httpx
 
 from .text.base import with_retries
+
+log = logging.getLogger("agent.providers.jev")
 
 ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 
@@ -83,10 +86,14 @@ def _validate(answer_raw: dict[str, Any], allowed: set[str]) -> ChoiceAnswer:
             reason = "one or more probability values out of [0,1] range or non-numeric"
         elif abs(sum(probs_raw.values()) - 1) >= 0.02:
             reason = f"probabilities sum to {sum(probs_raw.values()):.3f}, not 1"
-        elif probs_raw[choice] < max(probs_raw.values()) - 1e-6:
-            reason = "chosen id is not the top-probability id"
     if reason is not None:
         raise JevError(f"Invalid Jev response ({reason}); allowed={sorted(allowed)[:6]}...")
+    if probs_raw[choice] < max(probs_raw.values()) - 1e-6:
+        # The distribution is the answer; a `choice` that disagrees with it is
+        # a label slip, not a reason to end the run. Seen live on DoorDash.
+        top = max(probs_raw, key=probs_raw.get)
+        log.warning("jev choice %r is not the top-probability id %r; using the top id", choice, top)
+        choice = top
     return ChoiceAnswer(
         choice=choice,
         probabilities={k: float(v) for k, v in probs_raw.items()},
@@ -220,10 +227,19 @@ async def _test_ask_mixed_live() -> None:
     print(f"live: operation={result.answers['operation'].choice} goal_met={result.nouls['goal_met'].noul:.2f}")
 
 
+def _test_choice_label_slip() -> None:
+    """Unit: a `choice` that disagrees with its own probabilities resolves to the
+    top-probability option instead of ending the run."""
+    answer = _validate({"choice": "c1", "probabilities": {"c0": 0.7, "c1": 0.3}, "confidence": 0.5}, {"c0", "c1"})
+    if answer.choice != "c0":
+        raise NoulTestFailure(f"label slip kept the wrong choice: {answer.choice}")
+
+
 if __name__ == "__main__":
     import asyncio
 
     _test_validate_noul()
+    _test_choice_label_slip()
     asyncio.run(_test_ask_mixed_live())  # before the mocked test, which may set a dummy key
     asyncio.run(_test_ask_mixed_mocked())
     print("jev.py inline tests passed")

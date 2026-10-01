@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 from agent.executor import Action, Executor, Occluded, Outcome, StalePage
 from agent.perception import Observation, detect_captcha, observe
 from agent.policy import Decision, NoFieldValue, decide, field_value, should_escalate
+from agent.policy.reinstruct import HINT_STEPS, Hint, evidence_present, reinstruct
 from agent.providers import JevClient, TextAdapter
 from agent.transport import (
     ActionEvent,
@@ -42,6 +43,7 @@ from .guards import (
     StaleTracker,
     combined_ban,
     is_blocked_tail,
+    reached_purchase,
     stale_over_limit,
     url_cycling,
 )
@@ -73,6 +75,9 @@ class RunState:
     # Whether the previous decision's step check failed. Escalation waits for a
     # second failure in a row, so one-off doubts do not call the LLM.
     check_failed: bool = False
+    # The text model's hint from the last escalation, and the step it was given at.
+    hint: Hint | None = None
+    hint_step: int = 0
 
 
 @dataclass(slots=True)
@@ -223,6 +228,13 @@ class Supervisor:
             }
             for entry in state.history
         ]
+        # A hint lasts HINT_STEPS steps, and only while its evidence is on the page.
+        if state.hint is not None and not (
+            len(state.history) - state.hint_step < HINT_STEPS and evidence_present(state.hint, observation)
+        ):
+            state.hint = None
+        guidance = state.hint.guidance if state.hint is not None else None
+        hint_control = state.hint.control if state.hint is not None else None
         try:
             decision = await decide(
                 client=self.jev,
@@ -230,6 +242,8 @@ class Supervisor:
                 goal=state.goal,
                 history=history_for_policy,
                 banned=banned,
+                guidance=guidance,
+                hint_control=hint_control,
             )
         except StalePage as err:
             state.stale = state.stale.bump(observation.marker, len(state.covered))
@@ -249,8 +263,9 @@ class Supervisor:
                 goal=state.goal,
                 history=history_for_policy,
                 banned=banned,
+                guidance=guidance,
+                hint_control=hint_control,
             )
-        # Log-only for now: record where an LLM would be asked to reinstruct.
         escalate = should_escalate(decision, state.check_failed)
         state.check_failed = decision.check == "failed"
         state.budget.spent(
@@ -259,6 +274,35 @@ class Supervisor:
             tokens_out=int(decision.usage.get("output_tokens", 0)),
             latency_ms=decision.latency_ms,
         )
+        if escalate:
+            # Stuck: a text model reads the page and writes a hint, then the
+            # policy decides again with it. The policy still picks the action.
+            pick = f"{decision.operation} {decision.action.label if decision.action else ''}".strip()
+            hint = await reinstruct(adapter=self.text, goal=state.goal, observation=observation,
+                                    history=history_for_policy, policy_pick=pick)
+            if hint is not None:
+                state.budget.spent(hint.model, tokens_in=hint.usage["prompt_tokens"],
+                                   tokens_out=hint.usage["completion_tokens"], latency_ms=hint.latency_ms)
+                state.hint, state.hint_step, guidance = hint, len(state.history), hint.guidance
+                decision = await decide(client=self.jev, observation=observation, goal=state.goal,
+                                        history=history_for_policy, banned=banned, guidance=guidance,
+                                        hint_control=hint.control)
+                if decision.operation in {"DONE", "BLOCKED"} and decision.check != "cleared":
+                    # The check rejected this stop and the hint did not change it:
+                    # keep working. Decide once more without that operation.
+                    state.budget.spent(decision.model, tokens_in=int(decision.usage.get("input_tokens", 0)),
+                                       tokens_out=int(decision.usage.get("output_tokens", 0)),
+                                       latency_ms=decision.latency_ms)
+                    decision = await decide(client=self.jev, observation=observation, goal=state.goal,
+                                            history=history_for_policy, banned={*banned, decision.operation},
+                                            guidance=guidance, hint_control=hint.control)
+                state.check_failed = False  # the hint resets the streak
+                state.budget.spent(
+                    decision.model,
+                    tokens_in=int(decision.usage.get("input_tokens", 0)),
+                    tokens_out=int(decision.usage.get("output_tokens", 0)),
+                    latency_ms=decision.latency_ms,
+                )
         await self._publish(DecisionEvent(
             run_id=state.run_id,
             seq=await self.bus.next_seq(),
@@ -277,7 +321,9 @@ class Supervisor:
             check=decision.check or "",
             check_p=decision.check_p,
             check_switch=decision.check_switch or "",
+            switched=decision.switched,
             escalate=escalate,
+            guidance=guidance or "",
         ))
         return decision
 
@@ -375,6 +421,14 @@ class Supervisor:
         except StalePage:
             state.covered.add(action.label)
             await self._emit_error("executor", RuntimeError("Stale target"))
+            return
+        if reached_purchase(outcome.final_url, state.goal):
+            # Hard stop, whatever the prompt said: leave the checkout page and
+            # ban the control that led there for the rest of the run.
+            state.covered.add(action.label)
+            await self._emit_error("supervisor", RuntimeError(
+                f"Purchase guard: {action.label!r} led to {outcome.final_url[:80]}; went back"))
+            await self.executor.act(Action(id="BACK", kind="back", label="Go back"))
             return
         state.history.append(HistoryEntry(
             step=len(state.history) + 1,

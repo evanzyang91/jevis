@@ -79,6 +79,8 @@ class Element:
     # visible text is "mouse pad" is one to flag.
     visible: str | None = None
     options: tuple[SelectOption, ...] = ()
+    # Radios only: which one-choice group this option belongs to.
+    group: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +121,9 @@ class Observation:
     scroll_step: int | None = None
     # The open modal dialog's own text. None when no modal is open.
     dialog_text: str | None = None
+    # For an option dialog: {"required_open": [...], "required_done": [...],
+    # "add_ready": bool, "add_control": label or None}. None otherwise.
+    dialog_status: dict | None = None
     # How many times `observe` re-read the page waiting for hydration.
     # Diagnostic only; 0 for a page that read cleanly on the first try.
     hydration_retries: int = 0

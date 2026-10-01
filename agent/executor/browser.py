@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -79,6 +80,12 @@ class Executor(Protocol):
     async def current_url(self) -> str: ...
     async def start_screencast(self, sink: FrameSink) -> None: ...
     async def stop_screencast(self) -> None: ...
+
+
+# Labels of controls whose only job is to close a dialog. For these, Escape is
+# the same action as the click; for any other control inside a modal, Escape
+# would close the dialog and lose its choices.
+_CLOSES = re.compile(r"^\s*(close|dismiss|cancel|no,? thanks|not now|×|x)\b", re.I)
 
 
 class PlaywrightExecutor:
@@ -233,10 +240,19 @@ class PlaywrightExecutor:
                         tb: TracebackType | None) -> None:
         if self._screencast_task is not None:
             self._screencast_task.cancel()
-        # Attached mode: never close the user's Chrome, and leave the tab we
-        # opened on-screen so the user can inspect the final page (a checkout
-        # summary, a watch page, a cart) after the run ends.
+        # Attached mode: never close the user's Chrome. Close the tabs this run
+        # opened (its own, and any popups from it), so runs do not pile tabs up
+        # in the user's browser. AGENT_KEEP_TAB=1 leaves them open to inspect.
         if self._attached:
+            keep = os.environ.get("AGENT_KEEP_TAB", "").strip().lower() in {"1", "true", "yes"}
+            if not keep and self._owns_page and self._context is not None:
+                opened = [self._page] if self._relay is None else list(self._context.pages)
+                for page in opened:  # through the relay, every page listed is one this run opened
+                    try:
+                        if page is not None and not page.is_closed():
+                            await page.close()
+                    except Exception:  # noqa: BLE001 — a tab already gone is fine
+                        pass
             if self._browser is not None:
                 try:
                     await self._browser.close()  # disconnects CDP; Chrome and the tab keep running
@@ -422,7 +438,24 @@ class PlaywrightExecutor:
         # press Escape). If the target is still occluded, raise Occluded so
         # the supervisor bans the label and re-decides.
         if not await self._point_hits_target(locator, target):
-            await self._dismiss_overlay()
+            if _CLOSES.match(action.label or "") and await self._in_open_modal(locator):
+                # The target closes its own dialog and is covered (DoorDash's
+                # overlay layer sits over "Close"): Escape does what the click
+                # means. Done here, with no click after it.
+                await self._dismiss_overlay()
+                return
+            if await self._in_open_modal(locator):
+                # Inside an open modal the cover is the dialog's own sticky
+                # header or footer, not an overlay to dismiss: Escape would
+                # close the dialog and lose every choice made in it. Bring the
+                # target into view inside the dialog and test again.
+                await locator.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest'})")
+                await asyncio.sleep(0.15)
+            else:
+                await self._dismiss_overlay()
+            if not await self._point_hits_target(locator, target):
+                box = await locator.bounding_box()
+                target = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2) if box else target
             if not await self._point_hits_target(locator, target):
                 raise Occluded(f"Target {action.label!r} covered by an overlay")
             # Overlay dismissal may have shifted layout; refresh coordinates.
@@ -468,6 +501,15 @@ class PlaywrightExecutor:
             )
             return bool(same)
         except Exception:  # noqa: BLE001 — treat any failure as "not verified"
+            return False
+
+    async def _in_open_modal(self, locator: Locator) -> bool:
+        """Whether the target sits inside an open modal dialog (aria-modal or a
+        native modal <dialog>), as the reader defines one."""
+        try:
+            return bool(await locator.evaluate(
+                "el => !!el.closest('[aria-modal=\"true\"], dialog:modal')"))
+        except Exception:  # noqa: BLE001 — unknown: fall back to the old path
             return False
 
     async def _dismiss_overlay(self) -> None:

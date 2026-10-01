@@ -122,9 +122,13 @@ class DecisionEvent(_EventBase):
     check: str = ""
     check_p: float = 0.0
     check_switch: str = ""
+    # True when the executed action is `check_switch`, not the policy's pick.
+    switched: bool = False
     # True where an LLM would be asked to reinstruct (two failed checks in a row,
     # or a failed DONE or BLOCKED). Log-only: the action is unchanged.
     escalate: bool = False
+    # The text model's hint this decision was made with, if any.
+    guidance: str = ""
 
 
 # ---- Execution --------------------------------------------------------------
