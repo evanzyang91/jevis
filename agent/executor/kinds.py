@@ -7,10 +7,15 @@ implementation can depend on.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
 ActionKind = Literal["click", "fill", "select", "scroll", "wait", "back", "enter"]
+
+# Labels of controls whose only job is to close a dialog. The executor and the
+# policy share this rule. A bare "x" or "×" closes; "X-Large" is an option.
+CLOSE_LABEL = re.compile(r"^\s*(?:(?:close|dismiss|cancel|no,? thanks|not now)\b|×|x\s*$)", re.I)
 
 
 @dataclass(frozen=True, slots=True)

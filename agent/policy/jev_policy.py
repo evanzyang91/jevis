@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from typing import Any
 
+from agent.executor import CLOSE_LABEL
 from agent.perception import Observation
 from agent.providers import JevClient, JevError, JevOversized
 
@@ -24,7 +25,7 @@ MAX_ACTION_SPACE = 60
 DIALOG_KIND_MIN = 0.6
 # The step check runs when the grouped signal is below CHECK_TRIGGER, or below
 # CHECK_TERMINAL for DONE and BLOCKED, which end the run. A candidate passes at
-# CHECK_PASS. Tuned offline on 84 labelled steps (2026-10-01); log-only for now.
+# CHECK_PASS. Tuned offline on 84 labelled steps (2026-10-01).
 CHECK_TRIGGER = 0.5
 CHECK_TERMINAL = 0.8
 CHECK_PASS = 0.7
@@ -76,13 +77,19 @@ def settled_options(observation: Observation, goal: str) -> set[str]:
             if e.checked or (e.group in finished and not goal_names(goal, e.name))}
 
 
-# Controls whose only job is to close a dialog (the executor uses the same rule).
-_CLOSE_CONTROL = re.compile(r"^\s*(close|dismiss|cancel|no,? thanks|not now|×|x)\b", re.I)
+_COUNT = re.compile(r"\b(?:[2-9]|[1-9]\d+|two|three|four|five|six|seven|eight|nine|ten|dozen|several|"
+                    r"pair|couple)\b", re.I)
 
 
-# A count followed by a capitalised word is part of an item's name ("Three Tacos").
-_ASKS_SEVERAL = re.compile(r"\b(?i:[2-9]|[1-9]\d+|two|three|four|five|six|seven|eight|nine|ten|dozen|several|"
-                           r"pair|couple)\b(?!\s+[A-Z])")
+def asks_several(goal: str) -> bool:
+    """Whether the goal asks for more than one of an item. A spelled-out count
+    in title case before another capitalised word is part of an item's name
+    ("Three Tacos"); a digit is always a count ("3 Coca-Cola cans")."""
+    for match in _COUNT.finditer(goal):
+        if match.group()[0].isupper() and re.match(r"\s+[A-Z]", goal[match.end():]):
+            continue
+        return True
+    return False
 
 
 def _operations_for(element) -> list[str]:  # noqa: ANN001
@@ -164,7 +171,7 @@ class Decision:
     # Labels that reached the model per operation (post-ban). Diagnostic —
     # tells post-hoc analysis whether the expected action was even in the
     # choice set when the model picked something else.
-    offered: Mapping[str, tuple[str, ...]] = ()  # type: ignore[assignment]
+    offered: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     # The open modal's diagnosis, when one was sent to the policy.
     dialog: str | None = None
     dialog_p: float = 0.0
@@ -251,17 +258,17 @@ async def decide(
     action space when the server reports the request oversized."""
     space = build(observation)
     banned = {*banned, *settled_options(observation, goal)}
-    if not _ASKS_SEVERAL.search(goal):
+    if not asks_several(goal):
         banned = {*banned, *(element.name for element in observation.elements
                              if _QUANTITY_CONTROL.search(element.name or ""))}
     diagnosis = await diagnose_dialog(client=client, observation=observation, goal=goal)
     dialog = diagnosis[0] if diagnosis and diagnosis[1] >= DIALOG_KIND_MIN else None
-    if dialog == "task" and not (hint_control and _CLOSE_CONTROL.match(hint_control)):
+    if dialog == "task" and not (hint_control and CLOSE_LABEL.match(hint_control)):
         # A task dialog holds what the goal needs; with its finished options
         # withheld, "Close" was the policy's pick at 0.55 and lost every choice.
         # Only a hint that names the close control (a wrong item) may close it.
         banned = {*banned, *(element.name for element in observation.elements
-                             if _CLOSE_CONTROL.match(element.name or ""))}
+                             if CLOSE_LABEL.match(element.name or ""))}
     attempts = 0
     max_targets = MAX_ACTION_SPACE
     while True:
@@ -766,8 +773,12 @@ async def _option_unit_tests() -> None:
     labels = [t.label for op in build(_radio_page(None)).operations for t in op.targets]
     if "Rice Required • Select 1" in labels:
         raise CheckTestFailure("group heading offered as a click")
+    # Close labels: a bare "x" or "×" closes; a size option that starts with X does not.
+    closes = {label: bool(CLOSE_LABEL.match(label)) for label in ("Close Salad", "×", "x", "X-Large", "X Small")}
+    if closes != {"Close Salad": True, "×": True, "x": True, "X-Large": False, "X Small": False}:
+        raise CheckTestFailure(f"close labels wrong: {closes}")
     # Task dialog: its close control is not offered, unless a hint names it.
-    closing = replace(_radio_page("White Rice VG 210 cal White Rice"), elements=(
+    closing =replace(_radio_page("White Rice VG 210 cal White Rice"), elements=(
         *_radio_page("White Rice VG 210 cal White Rice").elements,
         replace(_radio_page(None).elements[0], ref="[data-agent-ref=e9]", role="button", name="Close Salad",
                 checked=None, group=None)))
@@ -828,8 +839,9 @@ async def _check_unit_tests() -> None:
     # a count inside an item's name ("Three Tacos") is not such a request.
     for text, several in (("Add two bags of flour.", True), ("Add 3 cartons of milk.", True),
                           ("Open Three Tacos and choose chicken.", False),
+                          ("Add 3 Coca-Cola cans.", True),
                           ("Search chips and guacamole and add one to the cart.", False)):
-        if bool(_ASKS_SEVERAL.search(text)) != several:
+        if asks_several(text) != several:
             raise CheckTestFailure(f"count detection wrong for {text!r}")
     # Gap 3: escalate on the second failure in a row, or at once for DONE/BLOCKED.
     failed = replace(cleared, check="failed")

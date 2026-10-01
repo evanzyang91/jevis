@@ -38,10 +38,15 @@ class Hint:
     control: str | None = None
 
 
+def _seen(observation: Observation) -> str:
+    """The page's text, dialog text, and control names, lower-cased."""
+    return " ".join([observation.text, observation.dialog_text or "",
+                     *(element.name for element in observation.elements)]).lower()
+
+
 def evidence_present(hint: Hint, observation: Observation) -> bool:
     """True while every evidence phrase is still on the page or its controls."""
-    seen = " ".join([observation.text, observation.dialog_text or "",
-                     *(element.name for element in observation.elements)]).lower()
+    seen = _seen(observation)
     return all(phrase.lower() in seen for phrase in hint.evidence)
 
 
@@ -76,12 +81,48 @@ async def reinstruct(
         return None
     if not guidance:
         return None
-    hint = Hint(guidance=guidance[:400], evidence=evidence, model=result.model,
+    # Evidence the page does not hold would expire the hint at once; drop it instead.
+    seen = _seen(observation)
+    return Hint(guidance=guidance[:400], evidence=tuple(p for p in evidence if p.lower() in seen),
+                model=result.model,
                 usage={"prompt_tokens": result.usage.prompt_tokens,
                        "completion_tokens": result.usage.completion_tokens},
                 latency_ms=result.latency_ms, control=control)
-    # Evidence the page does not hold would expire the hint at once; drop it instead.
+
+
+# ---- Inline tests: `uv run python -m agent.policy.reinstruct` ------------------------
+
+
+class ReinstructTestFailure(AssertionError):
+    """An inline reinstruct test saw the wrong result."""
+
+
+async def _test_evidence_kept_only_if_on_page() -> None:
+    """Unit, stand-in text model: evidence the page holds is kept, evidence it
+    does not hold is dropped, and the hint then lives on that page."""
+    from types import SimpleNamespace
+
+    from agent.perception import Element, Rect
+
+    class _Adapter:
+        async def complete(self, **_: Any) -> Any:
+            reply = {"guidance": "Choose Sofritas.", "evidence": ["Choose Protein", "Not on page"],
+                     "control": "Sofritas"}
+            return SimpleNamespace(text=json.dumps(reply), model="stand-in", latency_ms=5,
+                                   usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
+
+    observation = Observation(
+        url="https://example.test/", title="Bowl", text="Choose Protein Required", marker="m", fingerprint="f",
+        elements=(Element(ref="[data-agent-ref=e0]", role="radio", name="Sofritas", bounds=Rect(0, 0, 10, 10)),),
+        guards={}, can_go_back=False, can_scroll_up=False, can_scroll_down=False, viewport=(1280, 800))
+    hint = await reinstruct(adapter=_Adapter(), goal="Order a sofritas bowl.",  # type: ignore[arg-type]
+                            observation=observation, history=[], policy_pick="CLICK Close")
+    if hint is None or hint.evidence != ("Choose Protein",) or hint.control != "Sofritas":
+        raise ReinstructTestFailure(f"hint wrong: {hint}")
     if not evidence_present(hint, observation):
-        hint = Hint(hint.guidance, tuple(p for p in evidence if evidence_present(
-            Hint("", (p,), "", {}, 0), observation)), hint.model, hint.usage, hint.latency_ms, hint.control)
-    return hint
+        raise ReinstructTestFailure("kept evidence not found on its own page")
+
+
+if __name__ == "__main__":
+    asyncio.run(_test_evidence_kept_only_if_on_page())
+    print("reinstruct.py inline tests passed")

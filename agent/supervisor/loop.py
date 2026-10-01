@@ -235,45 +235,9 @@ class Supervisor:
             state.hint = None
         guidance = state.hint.guidance if state.hint is not None else None
         hint_control = state.hint.control if state.hint is not None else None
-        try:
-            decision = await decide(
-                client=self.jev,
-                observation=observation,
-                goal=state.goal,
-                history=history_for_policy,
-                banned=banned,
-                guidance=guidance,
-                hint_control=hint_control,
-            )
-        except StalePage as err:
-            state.stale = state.stale.bump(observation.marker, len(state.covered))
-            if stale_over_limit(state.stale):
-                state.status = "blocked"
-            raise err
-        except Exception as err:  # noqa: BLE001 — retry a rejected-answer error once
-            # A rejected Jev answer executes nothing, so asking again is not
-            # a mutation retry. Large repetitive action spaces provoke this
-            # often enough that a one-shot retry was worth several failed
-            # runs in old jevis. Any other error propagates unchanged.
-            if "Invalid Jev response" not in str(err):
-                raise
-            decision = await decide(
-                client=self.jev,
-                observation=observation,
-                goal=state.goal,
-                history=history_for_policy,
-                banned=banned,
-                guidance=guidance,
-                hint_control=hint_control,
-            )
+        decision = await self._ask_policy(state, observation, history_for_policy, banned, guidance, hint_control)
         escalate = should_escalate(decision, state.check_failed)
         state.check_failed = decision.check == "failed"
-        state.budget.spent(
-            decision.model,
-            tokens_in=int(decision.usage.get("input_tokens", 0)),
-            tokens_out=int(decision.usage.get("output_tokens", 0)),
-            latency_ms=decision.latency_ms,
-        )
         if escalate:
             # Stuck: a text model reads the page and writes a hint, then the
             # policy decides again with it. The policy still picks the action.
@@ -284,25 +248,14 @@ class Supervisor:
                 state.budget.spent(hint.model, tokens_in=hint.usage["prompt_tokens"],
                                    tokens_out=hint.usage["completion_tokens"], latency_ms=hint.latency_ms)
                 state.hint, state.hint_step, guidance = hint, len(state.history), hint.guidance
-                decision = await decide(client=self.jev, observation=observation, goal=state.goal,
-                                        history=history_for_policy, banned=banned, guidance=guidance,
-                                        hint_control=hint.control)
-                if decision.operation in {"DONE", "BLOCKED"} and decision.check != "cleared":
+                decision = await self._ask_policy(state, observation, history_for_policy, banned,
+                                                  guidance, hint.control)
+                if decision.operation in {"DONE", "BLOCKED"} and decision.check == "failed":
                     # The check rejected this stop and the hint did not change it:
                     # keep working. Decide once more without that operation.
-                    state.budget.spent(decision.model, tokens_in=int(decision.usage.get("input_tokens", 0)),
-                                       tokens_out=int(decision.usage.get("output_tokens", 0)),
-                                       latency_ms=decision.latency_ms)
-                    decision = await decide(client=self.jev, observation=observation, goal=state.goal,
-                                            history=history_for_policy, banned={*banned, decision.operation},
-                                            guidance=guidance, hint_control=hint.control)
+                    decision = await self._ask_policy(state, observation, history_for_policy,
+                                                      {*banned, decision.operation}, guidance, hint.control)
                 state.check_failed = False  # the hint resets the streak
-                state.budget.spent(
-                    decision.model,
-                    tokens_in=int(decision.usage.get("input_tokens", 0)),
-                    tokens_out=int(decision.usage.get("output_tokens", 0)),
-                    latency_ms=decision.latency_ms,
-                )
         await self._publish(DecisionEvent(
             run_id=state.run_id,
             seq=await self.bus.next_seq(),
@@ -325,6 +278,35 @@ class Supervisor:
             escalate=escalate,
             guidance=guidance or "",
         ))
+        return decision
+
+    async def _ask_policy(self, state: RunState, observation: Observation, history: list[dict],
+                          banned: set[str], guidance: str | None, hint_control: str | None) -> Decision:
+        """One policy decision, charged to the run's budget. Every call in a
+        step, hinted or not, gets the same stale-page and retry handling."""
+        ask = dict(client=self.jev, observation=observation, goal=state.goal, history=history,
+                   banned=banned, guidance=guidance, hint_control=hint_control)
+        try:
+            decision = await decide(**ask)
+        except StalePage as err:
+            state.stale = state.stale.bump(observation.marker, len(state.covered))
+            if stale_over_limit(state.stale):
+                state.status = "blocked"
+            raise err
+        except Exception as err:  # noqa: BLE001 — retry a rejected-answer error once
+            # A rejected Jev answer executes nothing, so asking again is not
+            # a mutation retry. Large repetitive action spaces provoke this
+            # often enough that a one-shot retry was worth several failed
+            # runs in old jevis. Any other error propagates unchanged.
+            if "Invalid Jev response" not in str(err):
+                raise
+            decision = await decide(**ask)
+        state.budget.spent(
+            decision.model,
+            tokens_in=int(decision.usage.get("input_tokens", 0)),
+            tokens_out=int(decision.usage.get("output_tokens", 0)),
+            latency_ms=decision.latency_ms,
+        )
         return decision
 
     async def _act(self, state: RunState, observation: Observation, decision: Decision) -> None:
@@ -609,3 +591,62 @@ async def drive_once(
         return
     await supervisor._act(state, observation, decision)  # noqa: SLF001
     state.budget.stepped()
+
+
+# ---- Inline tests: `uv run python -m agent.supervisor.loop` --------------------------
+
+
+class LoopTestFailure(AssertionError):
+    """An inline supervisor test saw the wrong result."""
+
+
+async def _test_hinted_decisions() -> None:
+    """Unit, stand-in policy and text model. After a hint: a rejected Jev answer
+    is retried, as on the first call; a stop the check never doubted (check None,
+    a confident DONE) is kept, not banned; every decision is charged once."""
+    import sys
+
+    loop = sys.modules[__name__]  # "__main__" when run with -m: patch the copy that runs
+
+    def made(operation: str, check: str | None) -> Decision:
+        return Decision(operation=operation, target=None, action=None, confidence=0.9, probabilities={},
+                        model="stand-in", latency_ms=1, usage={"input_tokens": 1, "output_tokens": 0},
+                        check=check)
+
+    replies: list[Any] = [made("DONE", "failed"), ValueError("Invalid Jev response (stand-in)"),
+                          made("DONE", None)]
+    calls: list[set[str]] = []
+
+    async def fake_decide(**kwargs: Any) -> Decision:
+        calls.append(set(kwargs["banned"]))
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    async def fake_reinstruct(**_: Any) -> Hint:
+        return Hint(guidance="The bowl is in the cart.", evidence=(), model="stand-in",
+                    usage={"prompt_tokens": 1, "completion_tokens": 1}, latency_ms=1)
+
+    saved = loop.decide, loop.reinstruct
+    loop.decide, loop.reinstruct = fake_decide, fake_reinstruct
+    try:
+        supervisor = Supervisor(executor=None, bus=Bus(), jev=None, text=None, goal="Order a bowl.")  # type: ignore[arg-type]
+        state = RunState(run_id=supervisor.run_id, goal=supervisor.goal)
+        observation = Observation(url="https://example.test/", title="Cart", text="1 item", elements=(),
+                                  marker="m", fingerprint="f", guards={}, can_go_back=False,
+                                  can_scroll_up=False, can_scroll_down=False, viewport=(1280, 800))
+        decision = await supervisor._decide(state, observation)  # noqa: SLF001
+    finally:
+        loop.decide, loop.reinstruct = saved
+    if decision.operation != "DONE" or replies:
+        raise LoopTestFailure(f"confident DONE after a hint was not kept: {decision.operation}, left={replies}")
+    if any("DONE" in banned for banned in calls):
+        raise LoopTestFailure("a DONE the check never doubted was banned")
+    if state.budget.tokens_in != 2 + 1:  # two decisions and the hint, each charged once
+        raise LoopTestFailure(f"budget charged wrong: {state.budget.tokens_in}")
+
+
+if __name__ == "__main__":
+    asyncio.run(_test_hinted_decisions())
+    print("loop.py inline tests passed")

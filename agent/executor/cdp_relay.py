@@ -175,9 +175,18 @@ class _Link:
                     if future is not None and not future.done():
                         future.set_result(message)
                 elif self.owner is not None:
-                    await self.owner._dispatch(message)
+                    try:
+                        await self.owner._dispatch(message)
+                    except Exception as err:  # noqa: BLE001 — a client-side failure must not end the shared link
+                        log.warning("cdp relay: could not pass a message to the client: %s", err)
         except websockets.ConnectionClosed:
             log.info("cdp relay: Chrome closed the debugging socket")
+        finally:
+            # Calls still waiting would otherwise wait out the full timeout.
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(RelayError("Chrome closed the debugging socket"))
+            self.pending.clear()
 
 
 class CdpTabRelay:
@@ -205,13 +214,19 @@ class CdpTabRelay:
         if self._link.owner is not None:
             raise RelayError("Another relay is using this Chrome connection; runs share it one at a time.")
         self._link.owner = self
-        if self._profile:
-            target_id = await self._open_in_profile()
-        else:
-            target_id = (await self._call("Target.createTarget", {"url": "about:blank"}))["targetId"]
-        self.target_id = target_id
-        self._allowed.add(target_id)
-        self._server = await websockets.serve(self._serve_client, "127.0.0.1", 0, max_size=None)
+        try:
+            if self._profile:
+                target_id = await self._open_in_profile()
+            else:
+                target_id = (await self._call("Target.createTarget", {"url": "about:blank"}))["targetId"]
+            self.target_id = target_id
+            self._allowed.add(target_id)
+            self._server = await websockets.serve(self._serve_client, "127.0.0.1", 0, max_size=None)
+        except BaseException:
+            # The caller's exit step does not run when its enter step fails:
+            # hand the link back here, or every later run in this process is refused.
+            self._link.owner = None
+            raise
         port = self._server.sockets[0].getsockname()[1]
         log.info("cdp relay: tab %s in profile %r on port %d", target_id[:8], self._profile, port)
         return f"ws://127.0.0.1:{port}/devtools/browser/relay"
@@ -528,6 +543,12 @@ async def _test_relays_share_one_connection() -> None:
         try:
             upstream = devtools_ws_url(Path(tmp))
             links = set()
+            # A start that fails (no such profile) hands the link back for the next run.
+            try:
+                await CdpTabRelay(upstream, profile="no such profile", user_data_dir=Path(tmp)).start()
+                raise RelayTestFailure("a start with an unknown profile succeeded")
+            except RelayError:
+                pass
             async with async_playwright() as pw:
                 for title in ("first run", "second run"):
                     relay = CdpTabRelay(upstream, user_data_dir=Path(tmp))

@@ -2,6 +2,7 @@
 
 from .browser import Executor, FakeExecutor, PlaywrightExecutor, with_executor
 from .kinds import (
+    CLOSE_LABEL,
     Action,
     ActionKind,
     NavigationInterrupted,
@@ -14,6 +15,7 @@ from .screencast import Frame, FrameSink, decode, start_params
 from .stealth import init_script
 
 __all__ = [
+    "CLOSE_LABEL",
     "Action",
     "ActionKind",
     "Executor",

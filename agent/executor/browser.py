@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-import re
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -32,7 +31,7 @@ from playwright.async_api import (
 )
 
 from .cdp_relay import CdpTabRelay, resolve_cdp_url
-from .kinds import Action, NavigationInterrupted, Occluded, Outcome, StalePage
+from .kinds import CLOSE_LABEL, Action, NavigationInterrupted, Occluded, Outcome, StalePage
 from .motion import typing_delays
 from .screencast import Frame, FrameSink, decode, start_params
 from .stealth import init_script
@@ -80,12 +79,6 @@ class Executor(Protocol):
     async def current_url(self) -> str: ...
     async def start_screencast(self, sink: FrameSink) -> None: ...
     async def stop_screencast(self) -> None: ...
-
-
-# Labels of controls whose only job is to close a dialog. For these, Escape is
-# the same action as the click; for any other control inside a modal, Escape
-# would close the dialog and lose its choices.
-_CLOSES = re.compile(r"^\s*(close|dismiss|cancel|no,? thanks|not now|×|x)\b", re.I)
 
 
 class PlaywrightExecutor:
@@ -438,7 +431,7 @@ class PlaywrightExecutor:
         # press Escape). If the target is still occluded, raise Occluded so
         # the supervisor bans the label and re-decides.
         if not await self._point_hits_target(locator, target):
-            if _CLOSES.match(action.label or "") and await self._in_open_modal(locator):
+            if CLOSE_LABEL.match(action.label or "") and await self._in_open_modal(locator):
                 # The target closes its own dialog and is covered (DoorDash's
                 # overlay layer sits over "Close"): Escape does what the click
                 # means. Done here, with no click after it.
