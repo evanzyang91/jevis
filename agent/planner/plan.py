@@ -21,10 +21,17 @@ from .prompts import PLAN_GOAL, SUGGEST_URL
 @dataclass(frozen=True, slots=True)
 class SubGoal:
     """One checkable step. `check` is the phrase the verifier reads out of
-    the page — kept short so the verifier does not weigh unrelated text."""
+    the page — kept short so the verifier does not weigh unrelated text.
+
+    `search_term` is the exact string to type when this subgoal reaches a
+    search field, or None when the subgoal does not involve typing a search
+    (a stop, a payment forbid, a post-add verification). The planner emits
+    it so the text helper does not have to re-infer the query on every fill.
+    """
 
     text: str
     check: str
+    search_term: str | None = None
 
 
 @dataclass(slots=True)
@@ -85,7 +92,14 @@ async def build_plan(*, adapter: TextAdapter, goal: str, url: str | None = None)
             check = item["check"].strip()
             if not text or not check:
                 raise ValueError("empty subgoal")
-            subgoals.append(SubGoal(text=text, check=check))
+            raw_term = item.get("search_term")
+            # Accept missing, null, or an empty string as "no term for this
+            # subgoal". A non-string value is a planner mistake — drop it to
+            # the helper instead of typing a dict into a search field.
+            search_term: str | None = None
+            if isinstance(raw_term, str) and raw_term.strip():
+                search_term = raw_term.strip()
+            subgoals.append(SubGoal(text=text, check=check, search_term=search_term))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as err:
         raise PlannerError(f"Planner returned an unusable plan: {result.text[:200]}") from err
     return Plan(

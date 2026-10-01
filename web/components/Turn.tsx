@@ -37,6 +37,14 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
               Working on <code>{hostOf(url)}</code>
             </div>
           )}
+          {/* The browser sits ABOVE the thinking trace. New steps grow below
+              it and never push it around — layout stays stable, and the
+              sticky offset keeps it visible while the step list scrolls. */}
+          {showBrowser && (
+            <div className={`turn-browser ${running ? "running" : ""}`}>
+              <LiveBrowser frame={frame} url={url} live={running} cursor={cursor} />
+            </div>
+          )}
           {running && (
             <p className="now">
               {run.status === "starting"
@@ -70,11 +78,6 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
                   Continue
                 </button>
               </div>
-            </div>
-          )}
-          {showBrowser && (
-            <div className="turn-browser">
-              <LiveBrowser frame={frame} url={url} live={running} cursor={cursor} />
             </div>
           )}
           {!running && (

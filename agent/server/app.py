@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from agent.planner.plan import _REGIONAL_HOSTS
 from agent.providers.registry import REGISTRY, defaults
 
 from .db import DatabaseHandle, open_database
@@ -79,6 +80,20 @@ class ResumeCaptchaRequest(BaseModel):
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True}
+
+
+@app.get("/config")
+async def config() -> dict:
+    """Server-side settings the UI needs to render presets correctly.
+
+    `region` and `localise` mirror what `agent.planner.plan.localise` does on
+    submit, so the composer can rewrite a preset URL to the regional storefront
+    at click-time — otherwise the input shows "walmart.com" even on a CA run,
+    which reads as a bug. Empty region means no mapping.
+    """
+    region = os.environ.get("AGENT_REGION", "").strip().upper()
+    hosts = _REGIONAL_HOSTS.get(region, {})
+    return {"region": region, "localise": hosts}
 
 
 @app.get("/models")

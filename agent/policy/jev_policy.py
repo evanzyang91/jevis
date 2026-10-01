@@ -258,6 +258,10 @@ async def decide(
     action space when the server reports the request oversized."""
     space = build(observation)
     banned = {*banned, *settled_options(observation, goal)}
+    # Hide a product-title link whose "Add to cart - <item>" sibling is right
+    # beside it in the action space, so a commit intent cannot route through
+    # the product page. Nothing fires when no add control is offered.
+    banned = {*banned, *_title_sibling_bans(space)}
     if not asks_several(goal):
         banned = {*banned, *(element.name for element in observation.elements
                              if _QUANTITY_CONTROL.search(element.name or ""))}
@@ -443,6 +447,38 @@ def _item_of(label: str) -> str:
     return _TRAILING_PRICE.sub("", _ROUTE_PREFIX.sub("", label.strip())).strip().lower()
 
 
+def _routed(label: str) -> bool:
+    """Whether a label is a committing route-prefixed control (`Add to cart - X`)."""
+    return bool(_ROUTE_PREFIX.match(label.strip()))
+
+
+def _title_sibling_bans(space: ActionSpace) -> set[str]:
+    """Labels of plain title links that share an item with a route-prefixed add
+    control on the same page. The policy's grouping already treats "X" and
+    "Add to cart - X" as one decision, but the model is free to pick either —
+    and sometimes picks the title link, which opens the product page and makes
+    the "add" subgoal a two-step journey. Banning the plain siblings when the
+    direct add is present leaves one obvious control for a commit intent, and
+    does nothing on pages where no add exists (then the title link is the
+    right thing to click). Site-agnostic: it reads only the route-prefix
+    marker already in `_ROUTE_PREFIX`.
+    """
+    labels: list[str] = []
+    for operation in space.operations:
+        if operation.id != "CLICK":
+            continue
+        for target in operation.targets:
+            if target.label:
+                labels.append(target.label)
+    if not labels:
+        return set()
+    routed_items = {_item_of(label) for label in labels if _routed(label)}
+    return {
+        label for label in labels
+        if not _routed(label) and _item_of(label) in routed_items
+    }
+
+
 def _same_control(a: str, b: str) -> bool:
     a, b = a.strip().lower(), b.strip().lower()
     return bool(a) and (a == b or a.startswith(b) or b.startswith(a)
@@ -531,13 +567,25 @@ async def check_step(
     )
 
 
+# Below this score, the check's best candidate is no better than a weak guess —
+# the policy is genuinely lost, not just a hair under the trigger. Escalate at
+# once instead of waiting for a second failure in a row, because a committing
+# action (add-to-cart, submit, send) taken at this level usually sticks and the
+# model never recovers inside the same subgoal. 0.45 sits well below the pass
+# bar (0.7) and above the "nothing scored" floor (0.0) in logged failures.
+CHECK_HOPELESS = 0.45
+
+
 def should_escalate(decision: Decision, previous_check_failed: bool) -> bool:
-    """Escalate a failed check only when it is not a one-off: the previous step
-    failed too, or this step ends the run (DONE, BLOCKED), which leaves no next
-    step to wait for. One-off doubts on good runs cost an LLM call each and were
-    harmless in every logged case; repeated doubt is how stuck runs look."""
+    """Escalate a failed check when it is not a one-off: the previous step
+    failed too, this step ends the run (DONE, BLOCKED, which leaves no next step
+    to wait for), or the check itself is hopeless (even the best candidate
+    scored below `CHECK_HOPELESS`, so the streak-wait would spend another step
+    on a wrong commit). One-off mild doubts on good runs stay cheap."""
     if decision.check != "failed":
         return False
+    if decision.check_p < CHECK_HOPELESS:
+        return True
     return previous_check_failed or decision.operation in {"DONE", "BLOCKED"}
 
 
@@ -798,7 +846,11 @@ async def _option_unit_tests() -> None:
     if not any("Close Salad" in str(c) for c in jev.offered):
         raise CheckTestFailure("a hint naming the close control could not close")
     # Hint control: the policy ignores the hint and fails its check; the named control is taken.
-    jev = _HintJev(0.9, [0.30, 0.25, 0.45], [])
+    # `_title_sibling_bans` hides the plain "Rogers Fine Granulated Sugar 4kg" title because its
+    # "Add to cart - …" sibling is also offered. Only the add and the favourites detour reach the
+    # model. Target_probs are now ordered to the surviving ids: add first, favourites second —
+    # keep the fav at 0.45 so its signal stays below CHECK_TRIGGER and the check runs.
+    jev = _HintJev(0.9, [0.10, 0.45], [])
     decision = await decide(client=jev, observation=_sugar_page(), goal="Add one bag of sugar to the cart.",
                             history=[], guidance="Click Add to cart.", hint_control=_SUGAR[1])  # type: ignore[arg-type]
     if decision.action is None or decision.action.label != _SUGAR[1] or not decision.switched:
@@ -813,14 +865,16 @@ async def _check_unit_tests() -> None:
         raise CheckTestFailure(f"routes not grouped: {signal}")
     if grouped_signal(0.9, _SUGAR[2], [(_SUGAR[0], 0.40), (_SUGAR[1], 0.35), (_SUGAR[2], 0.25)]) != 0.25:
         raise CheckTestFailure("favourites detour was grouped with the item")
-    # Gap 2: no check when the grouped signal is high (0.40 + 0.35 = 0.75).
-    jev = _SplitJev(0.9, [0.40, 0.35, 0.25], [0.9, 0.9, 0.1])
+    # Gap 2: no check when the grouped signal is high. `_title_sibling_bans` hides the plain
+    # title because its "Add to cart - …" sibling is offered, so only [add, favourites] reach the
+    # model. With the add at 0.75 — above CHECK_TRIGGER — the check never runs.
+    jev = _SplitJev(0.9, [0.75, 0.15], [0.9, 0.9, 0.1])
     decision = await decide(client=jev, observation=_sugar_page(), goal=goal, history=[])  # type: ignore[arg-type]
     if jev.checks or decision.check is not None:
         raise CheckTestFailure("check ran on a confident decision")
     # Gap 2: an unsure pick (the favourites detour at 0.45) is checked and logged; the
-    # better candidate is named, and the action stays the policy's own pick.
-    jev = _SplitJev(0.9, [0.30, 0.25, 0.45], [0.10, 0.85, 0.90])  # pick first: fav, open, add
+    # better candidate — the add control — is named, and the action switches to it.
+    jev = _SplitJev(0.9, [0.10, 0.45], [0.10, 0.85, 0.90])  # pick first: add, favourites
     decision = await decide(client=jev, observation=_sugar_page(), goal=goal, history=[])  # type: ignore[arg-type]
     if jev.checks != 1 or decision.check != "cleared" or decision.check_switch != _SUGAR[1]:
         raise CheckTestFailure(f"check not logged: {decision.check} {decision.check_switch}")
@@ -851,6 +905,11 @@ async def _check_unit_tests() -> None:
         raise CheckTestFailure("failed DONE did not escalate at once")
     if should_escalate(cleared, previous_check_failed=True):
         raise CheckTestFailure("cleared check escalated")
+    # Hopeless check (best candidate below CHECK_HOPELESS) escalates at once,
+    # before a second-failure streak would let the committing action land.
+    hopeless = replace(failed, check_p=CHECK_HOPELESS - 0.01)
+    if not should_escalate(hopeless, previous_check_failed=False):
+        raise CheckTestFailure("hopeless check did not escalate at once")
 
 
 async def _check_e2e_live() -> None:
@@ -887,12 +946,52 @@ async def _check_e2e_live() -> None:
         raise CheckTestFailure("DONE without barbacoa passed the check")
 
 
+def _test_title_sibling_bans() -> None:
+    """Non-route title siblings get banned when a route-prefix sibling exists;
+    nothing is banned on a page that only offers titles (an item configurator)
+    or only offers add buttons."""
+    from agent.executor import Action
+    from agent.policy.action_space import ActionSpace, Operation, Target
+
+    def tgt(label: str, idx: int) -> Target:
+        action = Action(id=f"click:e{idx}", kind="click", label=label, locator=f"e{idx}")
+        return Target(id=f"c{idx}", label=label, action=action)
+
+    # Both title and add offered — the title is banned.
+    mixed = ActionSpace(operations=(Operation(id="CLICK", label="Click", targets=(
+        tgt("Gay Lea Salted Butter", 1),
+        tgt("Add to cart - Gay Lea Salted Butter", 2),
+        tgt("Gay Lea Unsalted Butter", 3),
+        tgt("Add to cart - Gay Lea Unsalted Butter", 4),
+        tgt("See all butter", 5),
+    )),))
+    bans = _title_sibling_bans(mixed)
+    if bans != {"Gay Lea Salted Butter", "Gay Lea Unsalted Butter"}:
+        raise AssertionError(f"wrong bans on a mixed results page: {bans}")
+
+    # Only titles offered (item configurator, no direct add) — nothing banned.
+    titles_only = ActionSpace(operations=(Operation(id="CLICK", label="Click", targets=(
+        tgt("Burrito Bowl", 1),
+        tgt("Barbacoa", 2),
+    )),))
+    if _title_sibling_bans(titles_only):
+        raise AssertionError("titles-only page should not ban anything")
+
+    # Only add buttons offered — nothing to ban.
+    adds_only = ActionSpace(operations=(Operation(id="CLICK", label="Click", targets=(
+        tgt("Add to cart - Flour", 1),
+    )),))
+    if _title_sibling_bans(adds_only):
+        raise AssertionError("adds-only page should not ban anything")
+
+
 if __name__ == "__main__":
     import asyncio
 
     asyncio.run(_unit_tests())
     asyncio.run(_check_unit_tests())
     asyncio.run(_option_unit_tests())
+    _test_title_sibling_bans()
     asyncio.run(_e2e_live())
     asyncio.run(_check_e2e_live())
     print("jev_policy.py inline dialog and step-check tests passed")

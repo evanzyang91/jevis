@@ -76,16 +76,26 @@ class RunManager:
         return run
 
     async def stop(self, run_id: UUID) -> None:
+        """Cancel the run's task and wait briefly for it to publish its
+        terminal status.
+
+        Only the task is cancelled — its own `async with PlaywrightExecutor`
+        tears the browser down on exit, so calling `executor.__aexit__` from
+        here would race the task's unwind and leave half-closed resources
+        behind. The short wait lets the supervisor's cancel branch publish a
+        "blocked / stopped by user" StatusEvent before this returns, so the
+        UI's `/api/runs/{id}/stop` fetch resolves after the status change,
+        not before.
+        """
         run = self._runs.get(run_id)
-        if run is None:
+        if run is None or run.task is None:
             return
-        if run.task is not None:
-            run.task.cancel()
-        if run.executor is not None:
-            try:
-                await run.executor.__aexit__(None, None, None)
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
+        run.task.cancel()
+        # `asyncio.wait` returns once the task is done (cancelled unwind
+        # finished) or the timeout elapses, WITHOUT cancelling the task again
+        # on timeout the way `wait_for` would. Same shape used by
+        # `_stop_superseded`.
+        await asyncio.wait({run.task}, timeout=5.0)
 
     async def _stop_superseded(self, run: Run) -> None:
         """Stop an older run for a newer one, and say so on its stream."""
@@ -207,6 +217,7 @@ class RunManager:
                     text=text_adapter,
                     goal=plan.refined_goal if plan is not None else run.goal,
                     run_id=run.run_id,
+                    plan=plan,
                 )
                 run.supervisor = supervisor
                 run.started = True

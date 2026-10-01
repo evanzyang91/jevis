@@ -31,6 +31,10 @@ export type Run = {
   reason: string;
   startedAt: number; // wall clock, ms
   endedAt: number | null;
+  // When the planner finished refining the goal — the start of the "act" phase.
+  // null until the plan event arrives. The second stopwatch reads from here so
+  // "time driving the browser" is visible without the planner round-trip.
+  planAt: number | null;
   plan: PlanEvent | null;
   observation: ObservationEvent | null;
   decision: DecisionEvent | null; // the latest; null again once its action runs
@@ -50,6 +54,7 @@ export function newRun(id: string, request: string): Run {
     reason: "",
     startedAt: Date.now(),
     endedAt: null,
+    planAt: null,
     plan: null,
     observation: null,
     decision: null,
@@ -72,6 +77,7 @@ export function reduce(run: Run, event: StreamEvent): Run {
   switch (event.kind) {
     case "plan":
       next.plan = event;
+      if (next.planAt === null) next.planAt = Date.now();
       break;
     case "observation":
       next.observation = event;
@@ -205,3 +211,10 @@ export const percent = (value: number) =>
   value === 0 ? "0%" : value < 0.001 ? "<0.1%" : `${(value * 100).toFixed(value < 0.01 ? 1 : 0)}%`;
 
 export const seconds = (ms: number, digits = 2) => `${(ms / 1000).toFixed(digits)} s`;
+
+// "Act" time: wall time since the plan event, excluding the planner round-trip
+// at the start. Null before the plan arrives (nothing meaningful to show yet).
+export function actMs(run: Run): number | null {
+  if (run.planAt === null) return null;
+  return (run.endedAt ?? Date.now()) - run.planAt;
+}

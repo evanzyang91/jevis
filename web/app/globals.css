@@ -149,6 +149,11 @@ body:has(.wa[data-theme="dark"]) { background: #131314; }
 /* ---- Thread ------------------------------------------------------------- */
 .wa .thread { flex: 1; overflow-y: auto; padding: 24px 20px 8px; overflow-anchor: none; }
 .wa .thread > * { max-width: 760px; margin-inline: auto; }
+/* Agent turns run wider than the 760px text cap so the live browser can grow
+   to about twice its old width without squishing it. Text content inside the
+   answer keeps the readable 760 cap (see rules on .answer > *). */
+.wa .thread > .turn.agent { max-width: min(1180px, calc(100vw - 40px)); }
+.wa .answer > :not(.turn-browser) { max-width: 760px; }
 
 /* Before the first request: the greeting, the cards, and the box. */
 .wa.idle main { justify-content: center; }
@@ -263,11 +268,72 @@ body:has(.wa[data-theme="dark"]) { background: #131314; }
 @keyframes wa-fade-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 .wa .acts li.failed { color: var(--muted); }
 .wa .acts li.failed::after { content: " · no change"; color: var(--red); font-size: 12px; }
+/* The live browser: anchored at the top of the thread's scroll area, wider
+   than the text column, and wrapped in a rotating rainbow border while the
+   run is active. The border is a `::before` pseudo set to the panel's inset
+   so it does not change the viewer's measured size — layout stays identical
+   with or without the animation.
+   `position: sticky` keeps the viewer visible while the step list below it
+   scrolls past, and because new steps are rendered BELOW the viewer in the
+   DOM (see Turn.tsx), the viewer never moves when a trace is added. */
 .wa .turn-browser {
-  margin-top: 14px;
-  border-radius: 12px;
+  position: sticky;
+  top: 16px;
+  z-index: 2;
+  margin: 14px auto 4px;
+  width: 100%;
+  isolation: isolate;
+  border-radius: 14px;
+}
+.wa .turn-browser > :first-child {
+  position: relative;
+  z-index: 1;
+  border-radius: inherit;
   overflow: hidden;
   background: var(--surface);
+}
+/* The gradient ring sits behind the panel; the panel's own background covers
+   the interior so only the inset border shows through. Only rendered while a
+   run is active — `.turn-browser` without `.running` has no pseudo, so a
+   finished turn carries no decoration (verdict text already signals the
+   state). `pointer-events: none` so the ring never eats clicks. */
+.wa .turn-browser.running::before {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  z-index: 0;
+  border-radius: 17px;
+  /* Palindromic sweep over the brand's three gradient stops so the rotation
+     loops seamlessly (blue → violet → rose → violet → blue). A straight
+     g1→g2→g3→g1 would show a rose→blue segment that isn't in the brand. */
+  background: conic-gradient(
+    from var(--rainbow-angle, 0deg),
+    var(--g1) 0%,
+    var(--g2) 25%,
+    var(--g3) 50%,
+    var(--g2) 75%,
+    var(--g1) 100%
+  );
+  pointer-events: none;
+  animation: wa-rainbow-spin 4s linear infinite;
+}
+
+/* Smooth angle animation needs `@property` — without it, browsers can only
+   tween keyframes, not CSS variables. Modern engines (Chrome 85+, Safari
+   16.4+, Firefox 128+) honour this; older engines fall back to a static
+   gradient, which still reads as a border. */
+@property --rainbow-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes wa-rainbow-spin {
+  from { --rainbow-angle: 0deg; }
+  to { --rainbow-angle: 360deg; }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Keep the ring but freeze it at the starting angle. */
+  .wa .turn-browser.running::before { animation: none; }
 }
 .wa .notice {
   margin: 12px 0 0;

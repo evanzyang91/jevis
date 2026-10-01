@@ -46,33 +46,90 @@ class RelayError(RuntimeError):
     """The relay could not reach Chrome, or could not find the profile."""
 
 
+def _default_chrome_user_data_dirs() -> list[Path]:
+    """Likely Chrome user data folders for this OS, in search order.
+
+    First the OS's regular Chrome dir, then the agent-dedicated profile that
+    `scripts/chrome.sh` launches by default. Checking the dedicated path too
+    means a user who ran that script does not also have to export
+    `AGENT_CHROME_USER_DATA_DIR` — the agent finds the DevToolsActivePort
+    wherever Chrome actually writes it.
+    """
+    home = Path.home()
+    if sys.platform == "darwin":
+        regular = home / "Library" / "Application Support" / "Google" / "Chrome"
+        agent = home / "Library" / "Application Support" / "Google" / "Chrome Agent"
+    elif sys.platform.startswith("win"):
+        base = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local")) / "Google"
+        regular = base / "Chrome" / "User Data"
+        agent = base / "Chrome Agent" / "User Data"
+    else:
+        regular = home / ".config" / "google-chrome"
+        agent = home / ".config" / "google-chrome-agent"
+    return [regular, agent]
+
+
 def chrome_user_data_dir() -> Path:
-    """Chrome's user data folder for this OS, unless the env overrides it."""
+    """Chrome's user data folder for this OS, unless the env overrides it.
+
+    Returns the explicit override when `AGENT_CHROME_USER_DATA_DIR` is set.
+    With no override, prefers whichever default path actually holds a live
+    `DevToolsActivePort` (so `scripts/chrome.sh`'s dedicated profile is picked
+    up automatically); if neither has one, returns the regular OS default so
+    the resulting error message points at the standard place.
+    """
     override = os.environ.get("AGENT_CHROME_USER_DATA_DIR", "").strip()
     if override:
         return Path(override).expanduser()
-    home = Path.home()
-    if sys.platform == "darwin":
-        return home / "Library" / "Application Support" / "Google" / "Chrome"
-    if sys.platform.startswith("win"):
-        return Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local")) / "Google" / "Chrome" / "User Data"
-    return home / ".config" / "google-chrome"
+    candidates = _default_chrome_user_data_dirs()
+    for candidate in candidates:
+        if (candidate / "DevToolsActivePort").exists():
+            return candidate
+    return candidates[0]
 
 
 def devtools_ws_url(user_data_dir: Path) -> str:
-    """The browser WebSocket Chrome writes when remote debugging is on.
+    """The browser WebSocket Chrome exposes when remote debugging is on.
 
-    Chrome's built-in switch (chrome://inspect/#remote-debugging) serves only
-    this socket, not /json/version, and picks a new port on every start."""
+    Chrome writes `DevToolsActivePort` with `port\\nws_path` on every start.
+    The ws path is a per-session UUID, so a stale file (left behind by a
+    crashed or killed Chrome) points at a non-existent target — the connect
+    then fails with "server rejected WebSocket connection: HTTP 404". When
+    the port's `/json/version` HTTP endpoint is live, prefer *its*
+    `webSocketDebuggerUrl` so a stale file self-heals; only fall back to the
+    file's path when that endpoint is unavailable (Chrome launched via
+    `chrome://inspect/#remote-debugging` serves only the socket)."""
     path = user_data_dir / "DevToolsActivePort"
     try:
         port, ws_path = path.read_text().split()[:2]
     except (OSError, ValueError) as err:
-        raise RelayError(
-            f"No usable {path}. Turn on remote debugging in chrome://inspect/#remote-debugging "
-            f"(or start Chrome with --remote-debugging-port), then retry."
-        ) from err
-    return f"ws://127.0.0.1:{port}{ws_path}"
+        tried = [str(c) for c in _default_chrome_user_data_dirs()]
+        hint = (
+            "No usable DevToolsActivePort. Either run `scripts/chrome.sh` to launch an agent-"
+            "controlled Chrome, OR start your Chrome with --remote-debugging-port (via "
+            "chrome://inspect/#remote-debugging), then retry. "
+            f"Searched: {tried}. "
+            "If Chrome is running under a non-default user-data-dir, set "
+            "AGENT_CHROME_USER_DATA_DIR to that path."
+        )
+        raise RelayError(hint) from err
+    live = _live_ws_url(port)
+    return live or f"ws://127.0.0.1:{port}{ws_path}"
+
+
+def _live_ws_url(port: str) -> str | None:
+    """Chrome's current browser WebSocket URL, from the HTTP introspection
+    endpoint. None when the endpoint is unreachable or the reply is malformed —
+    the caller then uses the (possibly stale) path from DevToolsActivePort.
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1.0) as resp:
+            payload = json.loads(resp.read())
+    except (OSError, ValueError):
+        return None
+    url = payload.get("webSocketDebuggerUrl")
+    return url if isinstance(url, str) and url.startswith("ws://") else None
 
 
 def resolve_cdp_url(raw: str) -> str:

@@ -4,8 +4,14 @@ PLAN_GOAL = """Rewrite the user goal for a small action-choosing agent.
 The agent acts on one page at a time with Click, Type_text, Select, and Scroll.
 Return a JSON object with two keys:
 - goal: the rewritten goal, ASD-STE100. One instruction per sentence, at most 20 words per sentence.
-- subgoals: an ordered list mirroring the sentences in `goal`. Each item has `text` (the sentence)
-  and `check` (the visible phrase or state the page must show for that step to be met).
+- subgoals: an ordered list mirroring the sentences in `goal`. Each item has:
+  - `text` (the sentence),
+  - `check` (the visible phrase or state the page must show for that step to be met),
+  - `search_term`: the exact string to type into a search field for this subgoal, or null when the
+    subgoal does not involve typing a search (stops, forbids, final verifications). The term is
+    the base item name, lowercase, with no site name and no quotes — "all-purpose flour", not
+    "'all-purpose flour' on Walmart". Keep it short enough that the retailer's search matches
+    multiple results; the agent picks a qualifying one.
 Rules:
 - Keep every requirement the user stated. Weaken nothing.
 - Never invent personal data, credentials, addresses, or payment details.
@@ -37,19 +43,26 @@ Rules:
 Example — user goal "buy a mouse from amazon":
 {"goal": "Search 'mouse' on Amazon. Add one wireless mouse to the cart. Do not place the order. Stop when the cart shows one mouse.",
  "subgoals": [
-   {"text": "Search 'mouse' on Amazon.", "check": "Results page shows mouse listings."},
-   {"text": "Add one wireless mouse to the cart.", "check": "Cart shows one mouse."},
-   {"text": "Stop when the cart shows one mouse.", "check": "Cart shows one mouse. Order not placed."}
+   {"text": "Search 'mouse' on Amazon.", "check": "Results page shows mouse listings.", "search_term": "mouse"},
+   {"text": "Add one wireless mouse to the cart.", "check": "Cart shows one mouse.", "search_term": null},
+   {"text": "Stop when the cart shows one mouse.", "check": "Cart shows one mouse. Order not placed.", "search_term": null}
  ]}
 Example — user goal "get me stuff for tacos on walmart":
 {"goal": "Search 'ground beef' on Walmart and add one pack to the cart. Search 'taco shells' and add one box. Search 'salsa' and add one jar. Search 'shredded cheese' and add one bag. If an item is out of stock, substitute the closest equivalent and continue. Do not place the order. Stop when the cart shows ground beef, taco shells, salsa, and shredded cheese.",
  "subgoals": [
-   {"text": "Search 'ground beef' on Walmart and add one pack to the cart.", "check": "Cart shows one pack of ground beef."},
-   {"text": "Search 'taco shells' and add one box.", "check": "Cart shows one box of taco shells."},
-   {"text": "Search 'salsa' and add one jar.", "check": "Cart shows one jar of salsa."},
-   {"text": "Search 'shredded cheese' and add one bag.", "check": "Cart shows one bag of shredded cheese."},
+   {"text": "Search 'ground beef' on Walmart and add one pack to the cart.", "check": "Cart shows one pack of ground beef.", "search_term": "ground beef"},
+   {"text": "Search 'taco shells' and add one box.", "check": "Cart shows one box of taco shells.", "search_term": "taco shells"},
+   {"text": "Search 'salsa' and add one jar.", "check": "Cart shows one jar of salsa.", "search_term": "salsa"},
+   {"text": "Search 'shredded cheese' and add one bag.", "check": "Cart shows one bag of shredded cheese.", "search_term": "shredded cheese"},
    {"text": "Stop when the cart shows ground beef, taco shells, salsa, and shredded cheese.",
-    "check": "Cart shows all four items. Order not placed."}
+    "check": "Cart shows all four items. Order not placed.", "search_term": null}
+ ]}
+Example — user goal "find a recent paper about transformer attention":
+{"goal": "Search 'transformer attention' on Google Scholar. Open the top result from the past year. Stop when the paper page is open.",
+ "subgoals": [
+   {"text": "Search 'transformer attention' on Google Scholar.", "check": "Results page shows paper listings.", "search_term": "transformer attention"},
+   {"text": "Open the top result from the past year.", "check": "Paper page is open.", "search_term": null},
+   {"text": "Stop when the paper page is open.", "check": "Paper page is open.", "search_term": null}
  ]}"""
 
 SUGGEST_URL = """Choose the website the agent must start on to serve the user request.

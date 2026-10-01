@@ -38,6 +38,16 @@ from .stealth import init_script
 
 _DEFAULT_PROFILE_DIR = Path.home() / ".cache" / "agent" / "profile"
 
+# Roles whose "fill" ends with an Enter press: a search field or a search-with-
+# autocomplete always submits on Enter across the web, so letting the executor
+# commit the fill removes one wasted step per search without any site-specific
+# wiring. Everything else (textbox, spinbutton) requires an explicit submit.
+_SUBMIT_ON_FILL_ROLES = frozenset({"searchbox", "combobox"})
+
+
+def _commits_on_fill(role: str | None) -> bool:
+    return role in _SUBMIT_ON_FILL_ROLES
+
 
 # In-page settle: resolves once the DOM stops mutating AND no NEW network
 # response has completed for `quiet_ms` since the settle started, or after
@@ -334,12 +344,14 @@ class PlaywrightExecutor:
                 await asyncio.sleep(0.1)
         except PlaywrightTimeout as err:
             raise StalePage(f"{action.kind} target vanished before input") from err
-        # Click and Enter frequently trigger navigation or a rerender. Wait
-        # for the page to settle: both DOM mutations and network responses
-        # quiet for a short window. Content-driven, not a fixed timeout, so
-        # a fast site returns in ~200ms while a slow lazy-rendering results
-        # page (Amazon, Walmart) takes up to the cap without stalling.
-        if action.kind in {"click", "enter", "back"}:
+        # Click, Enter, Back, and submit-on-fill all frequently trigger
+        # navigation or a rerender. Wait for the page to settle: both DOM
+        # mutations and network responses quiet for a short window. Content-
+        # driven, not a fixed timeout, so a fast site returns in ~200ms while
+        # a slow lazy-rendering results page (Amazon, Walmart) takes up to the
+        # cap without stalling.
+        submits_fill = action.kind == "fill" and _commits_on_fill(action.role)
+        if action.kind in {"click", "enter", "back"} or submits_fill:
             await self._wait_for_settle()
         url_changed = self.page.url != before_url
         # A URL change means a new document. Give the SPA router time to
@@ -543,6 +555,36 @@ class PlaywrightExecutor:
         delays = typing_delays(action.value, self._rng)
         mean_delay = sum(delays) // len(delays) if delays else 0
         await self.page.keyboard.type(action.value, delay=mean_delay)
+        # Commit on Enter for roles that mean "submit on Enter" everywhere:
+        # a searchbox (any search field, URL bar, filter input) and a combobox
+        # (autocomplete-backed search, address lookup). Saves one step per
+        # search — the model otherwise fills, then separately clicks a Search
+        # button — and keeps the loop-progress signal (url_changed) tied to
+        # the fill rather than deferred to the next step. Textbox and
+        # spinbutton do NOT commit here: a textbox is usually one of several
+        # fields in a form (login, address) and auto-submitting on the first
+        # fill would strand the rest unfilled.
+        if _commits_on_fill(action.role):
+            # Short wait for the autocomplete JS to mount before the Enter
+            # dispatch — Walmart's combobox opens its suggestions on the last
+            # keystroke, and an Enter that lands mid-mount is swallowed.
+            await asyncio.sleep(0.12)
+            # Dispatch via CDP, the same path the click uses. `keyboard.press`
+            # routes to whatever element currently holds focus; on an SPA with
+            # an autocomplete popup, that focus can be the popup, not the
+            # input, and the submit handler never fires. `Input.dispatchKeyEvent`
+            # sends the raw key event at the page level with the trusted bit
+            # set, which Walmart's search handler accepts.
+            cdp = await self._ensure_cdp()
+            for kind, text in (("keyDown", "\r"), ("keyUp", "")):
+                await cdp.send("Input.dispatchKeyEvent", {
+                    "type": kind,
+                    "key": "Enter",
+                    "code": "Enter",
+                    "windowsVirtualKeyCode": 13,
+                    "nativeVirtualKeyCode": 13,
+                    **({"text": text, "unmodifiedText": text} if text else {}),
+                })
 
     async def _select(self, action: Action) -> None:
         locator = await self._locator(action)

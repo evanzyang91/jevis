@@ -12,7 +12,7 @@ import { Logo } from "@/components/Logo";
 import { Turn } from "@/components/Turn";
 import { type CursorEvent, isCursorEvent } from "@/components/cursor";
 import type { FrameEvent } from "@/lib/events";
-import { type Run, isTerminal, newRun, reduce, seconds } from "@/lib/run";
+import { type Run, actMs, isTerminal, newRun, reduce, seconds } from "@/lib/run";
 import { useFollowBottom } from "@/lib/follow";
 import { useVoice } from "@/lib/voice";
 import { subscribeEvents, subscribeFrames } from "@/lib/ws";
@@ -23,7 +23,7 @@ import { subscribeEvents, subscribeFrames } from "@/lib/ws";
 // and on DoorDash the agent finds the nearest store from the address the site shows.
 const EXAMPLES: { text: string; url: string; icon: string }[] = [
   {
-    text: "Add the ingredients for a chocolate cake to my cart",
+    text: "Buy me cake ingredients from walmart",
     url: "https://www.walmart.com/",
     icon: "M3 4h2l2.4 11h10.2L20 7H6.2M9 20h.01M17 20h.01",
   },
@@ -56,6 +56,23 @@ const STATUS_LINE: Record<Run["status"], string> = {
 const THEME_KEY = "agent-theme";
 const DEV_KEY = "agent-dev-view";
 
+// Rewrite a URL's host via the server-provided map ("walmart.com" ->
+// "www.walmart.ca"), mirroring `agent.planner.plan.localise`. Returns the
+// input unchanged when there's no mapping. Scheme and path survive.
+const localise = (raw: string, hosts: Record<string, string>): string => {
+  if (!raw) return raw;
+  try {
+    const url = new URL(raw);
+    const bare = url.hostname.replace(/^www\./, "");
+    const mapped = hosts[bare];
+    if (!mapped) return raw;
+    url.hostname = mapped;
+    return url.toString();
+  } catch {
+    return raw;
+  }
+};
+
 const remember = (key: string, value: string) => {
   try {
     localStorage.setItem(key, value);
@@ -83,6 +100,11 @@ export default function Home() {
   const [systemDark, setSystemDark] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState("");
+  // Server-side regional storefront map (walmart.com -> www.walmart.ca when
+  // AGENT_REGION=CA). Empty on no region. Used to localise preset URLs at
+  // click-time so the input shows the storefront the agent will actually
+  // open, not the global .com placeholder.
+  const [localiseHosts, setLocaliseHosts] = useState<Record<string, string>>({});
   const [, tick] = useState(0);
   const goalBox = useRef<HTMLTextAreaElement | null>(null);
   const thread = useRef<HTMLDivElement | null>(null);
@@ -109,6 +131,15 @@ export default function Home() {
         setModels(data.models.filter((m) => m.modalities.includes("text") && !m.id.startsWith("jev")).map((m) => m.id));
       })
       .catch(() => setError("Cannot reach the agent server. Start it with `uv run agent`."));
+    fetch("/api/config")
+      .then((r) => r.json())
+      .then((data: { region?: string; localise?: Record<string, string> }) => {
+        if (data.localise) setLocaliseHosts(data.localise);
+      })
+      .catch(() => {
+        // Non-fatal: without this, preset URLs stay on the global .com domain
+        // but the server still localises on submit — just the UI shows .com.
+      });
     return () => query.removeEventListener("change", follow);
   }, []);
 
@@ -205,6 +236,7 @@ export default function Home() {
   };
 
   const elapsed = current ? (current.endedAt ?? Date.now()) - current.startedAt : 0;
+  const act = current ? actMs(current) : null; // null until the plan event lands
   const modelMs = current ? current.budget?.model_ms ?? current.modelMs : 0;
 
   return (
@@ -218,7 +250,22 @@ export default function Home() {
           <span>Jevis</span>
         </div>
         <div className="header-right">
-          {current && <span className="elapsed">{seconds(elapsed)}</span>}
+          {current && (
+            <span
+              className="elapsed"
+              title="Elapsed since the request was sent (includes the planner)"
+            >
+              {seconds(elapsed)}
+            </span>
+          )}
+          {current && act !== null && (
+            <span
+              className="elapsed model"
+              title="Time driving the browser (from plan ready, excludes the planner)"
+            >
+              act {seconds(act)}
+            </span>
+          )}
           {current && dev && <span className="elapsed model">model {seconds(modelMs)}</span>}
           <button
             type="button"
@@ -260,7 +307,7 @@ export default function Home() {
                     className="example"
                     onClick={() => {
                       setGoal(example.text);
-                      setUrl(example.url);
+                      setUrl(localise(example.url, localiseHosts));
                       goalBox.current?.focus();
                     }}
                   >

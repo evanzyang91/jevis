@@ -144,7 +144,13 @@ STEP_CHECK = {
         "Opening an item's page and adding that item to the cart both advance adding that item. "
         "A control that leaves the task does not advance it: sign-in, a favourites or wish list, "
         "other stores, or a control of the page behind an open dialog. Repeating an action whose "
-        "page_changed was false does not advance it."
+        "page_changed was false does not advance it. "
+        "A committing control (`Add to cart`, `Add to order`, `Place order`, `Submit`) must name "
+        "the item the goal names. The goal's words identify the item KIND; accept a brand or "
+        "packaging variation (\"Great Value All-Purpose Flour\" for \"flour\"), but refuse a "
+        "different kind (\"golden yellow sugar\" is not \"granulated sugar\"; \"almond milk\" is "
+        "not \"whole milk\"; a chicken bowl is not a barbacoa bowl). On an item page or a "
+        "configurator, the open item itself must match the goal's named item in the same way."
     ),
 }
 

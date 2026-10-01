@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 from agent.executor import Action, Executor, Occluded, Outcome, StalePage
 from agent.perception import Observation, detect_captcha, observe
+from agent.planner import Plan
 from agent.policy import Decision, NoFieldValue, decide, field_value, should_escalate
 from agent.policy.reinstruct import HINT_STEPS, Hint, evidence_present, reinstruct
 from agent.providers import JevClient, TextAdapter
@@ -49,6 +50,46 @@ from .guards import (
 )
 
 RunStatus = str  # "running" | "done" | "blocked" | "error"
+
+
+def _next_search_term(plan: Plan, history: list["HistoryEntry"], current_value: str | None) -> str | None:
+    """The next unsatisfied search subgoal's term, or None when the fast path
+    cannot serve this fill.
+
+    Each committing Add in history (`Add to cart - X`, `Add to order - X`,
+    `Add item to cart - X`) is matched to the first unsatisfied subgoal whose
+    `search_term` is a substring of X. That way a duplicate add on an already-
+    satisfied subgoal (flour added twice) does not consume the next subgoal's
+    slot, and a run that added six items but silently skipped sugar keeps
+    returning "sugar" from the fast path until sugar is actually in the cart.
+
+    Returning None hands the fill back to the text helper: every planned
+    subgoal is satisfied, or the field already holds the term we would type
+    (a retry — the previous search found nothing useful, so let the helper
+    pick something more specific).
+    """
+    search_subs = [s for s in plan.subgoals if s.search_term]
+    satisfied = [False] * len(search_subs)
+    for entry in history:
+        if entry.operation != "CLICK" or not entry.page_changed:
+            continue
+        label = (entry.action_label or "").lower()
+        if not label.startswith(("add to cart", "add to order", "add item to cart")):
+            continue
+        for i, subgoal in enumerate(search_subs):
+            if satisfied[i]:
+                continue
+            if subgoal.search_term.strip().lower() in label:
+                satisfied[i] = True
+                break
+    for i, subgoal in enumerate(search_subs):
+        if satisfied[i]:
+            continue
+        term = subgoal.search_term.strip()
+        if current_value and current_value.strip().lower() == term.lower():
+            return None
+        return term
+    return None
 
 
 @dataclass(slots=True)
@@ -95,6 +136,10 @@ class Supervisor:
     goal: str
     run_id: UUID = field(default_factory=uuid4)
     state: RunState | None = None
+    # Optional. When present, the fill fast-path reads pre-generated search
+    # terms from the plan's subgoals instead of asking the text helper. None
+    # (test harness, no planner) keeps the old helper-every-fill behaviour.
+    plan: Plan | None = None
 
     async def run(self, start_url: str) -> RunState:
         state = RunState(run_id=self.run_id, goal=self.goal)
@@ -145,6 +190,16 @@ class Supervisor:
                     break
                 await self._act(state, observation, decision)
                 state.budget.stepped()
+        except asyncio.CancelledError:
+            # Stop button, server shutdown, or a newer run superseding this
+            # one. CancelledError is a BaseException, so the `except Exception`
+            # below does not catch it — without this branch the loop exits
+            # without emitting a terminal status, leaving the UI stuck on
+            # "running" and the stop button looking dead.
+            state.status = "blocked"
+            done_reason = "stopped by user"
+            await self._publish_status(state, state.status, done_reason)
+            raise
         except Exception as err:  # noqa: BLE001 — report and stop, do not swallow
             state.status = "error"
             done_reason = str(err)[:200]
@@ -501,6 +556,21 @@ class Supervisor:
 
     async def _compose_text(self, state: RunState, observation: Observation, action: Action) -> str:
         element = observation.by_ref(action.locator or "")
+        role = element.role if element else "textbox"
+        current_value = element.value if element else None
+        # Fast path: a search field on a run that has a planner-written
+        # `search_term` for the next unfinished item. The planner already knew
+        # the exact query at plan time, so re-asking the text helper on every
+        # fill is pure overhead (one Haiku round-trip, 1-2s on the happy path,
+        # 10s+ on the slow tail). Skipped when: no plan on this supervisor,
+        # the field is a login/address/quantity textbox, every search term has
+        # been typed, or the field already holds the term we would type — the
+        # last case means the model is deliberately re-filling, probably
+        # because the previous query failed, so let the helper refine.
+        if role in {"searchbox", "combobox"} and self.plan is not None:
+            term = _next_search_term(self.plan, state.history, current_value)
+            if term is not None:
+                return term
         history_for_helper: list[dict[str, Any]] = [
             {"step": entry.step, "label": entry.action_label, "page_changed": entry.page_changed}
             for entry in state.history
@@ -510,8 +580,8 @@ class Supervisor:
                 adapter=self.text,
                 goal=state.goal,
                 field_name=(element.name if element else action.label) or "",
-                field_role=element.role if element else "textbox",
-                current_value=element.value if element else None,
+                field_role=role,
+                current_value=current_value,
                 page_text=observation.text,
                 history=history_for_helper,
             )
@@ -647,6 +717,97 @@ async def _test_hinted_decisions() -> None:
         raise LoopTestFailure(f"budget charged wrong: {state.budget.tokens_in}")
 
 
+def _test_search_term_fast_path() -> None:
+    """Fast path advances on committing adds matched to subgoals BY NAME,
+    not by raw count: a typed-then-cleared term stays active, a duplicate add
+    on an already-satisfied subgoal does not consume the next subgoal's slot,
+    and the plan is exhausted only when every search subgoal has an add whose
+    label names it."""
+    from agent.planner import Plan, SubGoal
+
+    plan = Plan(
+        original_goal="buy cake stuff",
+        refined_goal="search things",
+        start_url="https://example.test/",
+        subgoals=[
+            SubGoal(text="Search 'flour'.", check="flour listings", search_term="flour"),
+            SubGoal(text="Search 'sugar'.", check="sugar listings", search_term="sugar"),
+            SubGoal(text="Stop.", check="done", search_term=None),
+        ],
+    )
+
+    def fill(step: int, text: str) -> HistoryEntry:
+        return HistoryEntry(step=step, operation="TYPE_TEXT", target=None, action_id="x",
+                            action_label="Search", marker="m", page_changed=True,
+                            url_changed=False, text=text)
+
+    def add(step: int, label: str) -> HistoryEntry:
+        return HistoryEntry(step=step, operation="CLICK", target=None, action_id="x",
+                            action_label=label, marker="m", page_changed=True,
+                            url_changed=False, text=None)
+
+    first = _next_search_term(plan, [], current_value=None)
+    if first != "flour":
+        raise LoopTestFailure(f"first fill not the plan's first term: {first!r}")
+
+    # Typed-then-cleared flour: no add landed. The next fill must retry flour,
+    # not jump ahead to sugar — the regression that lost Walmart sugar.
+    typed_only = _next_search_term(plan, [fill(1, "flour")], current_value=None)
+    if typed_only != "flour":
+        raise LoopTestFailure(f"typed-only term wrongly advanced: {typed_only!r}")
+
+    # One add matching the flour subgoal → cursor advances to sugar.
+    after_flour_add = _next_search_term(
+        plan, [fill(1, "flour"), add(2, "Add to cart - Great Value Flour")], current_value=None,
+    )
+    if after_flour_add != "sugar":
+        raise LoopTestFailure(f"second fill not the plan's second term: {after_flour_add!r}")
+
+    # DUPLICATE flour add on a page that already added flour: must NOT advance
+    # past sugar. The real Walmart run hit this when the model clicked Add on
+    # the same flour listing twice — the old count-based fast path then said
+    # "7 adds, 7 subgoals, done" even though sugar was never added.
+    dup_flour = _next_search_term(
+        plan,
+        [add(1, "Add to cart - Great Value Flour"),
+         add(2, "Add to cart - Great Value Flour")],
+        current_value=None,
+    )
+    if dup_flour != "sugar":
+        raise LoopTestFailure(f"duplicate flour add wrongly consumed sugar: {dup_flour!r}")
+
+    # Both subgoals satisfied by distinct adds → plan exhausted.
+    all_added = _next_search_term(
+        plan,
+        [add(1, "Add to cart - Flour"), add(2, "Add to cart - Sugar")],
+        current_value=None,
+    )
+    if all_added is not None:
+        raise LoopTestFailure(f"exhausted plan returned {all_added!r}, want None")
+
+    # Out-of-order adds (sugar added before flour) still satisfy by name match.
+    reordered = _next_search_term(
+        plan,
+        [add(1, "Add to cart - Sugar"), add(2, "Add to cart - Flour")],
+        current_value=None,
+    )
+    if reordered is not None:
+        raise LoopTestFailure(f"out-of-order adds should still exhaust the plan: {reordered!r}")
+
+    retry = _next_search_term(plan, [], current_value="flour")
+    if retry is not None:
+        raise LoopTestFailure(f"retry on same term should fall back: got {retry!r}")
+
+    empty = _next_search_term(
+        Plan(original_goal="g", refined_goal="g", start_url="u",
+             subgoals=[SubGoal(text="Stop.", check="done", search_term=None)]),
+        [], current_value=None,
+    )
+    if empty is not None:
+        raise LoopTestFailure(f"plan with no search_term returned {empty!r}, want None")
+
+
 if __name__ == "__main__":
     asyncio.run(_test_hinted_decisions())
+    _test_search_term_fast_path()
     print("loop.py inline tests passed")
