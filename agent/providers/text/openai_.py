@@ -38,8 +38,10 @@ class OpenAIAdapter(TextAdapter):
         client: httpx.AsyncClient | None = None,
         base_url: str | None = None,
         api_key_env: str = "OPENAI_API_KEY",
+        reasoning_effort: str | None = None,
     ) -> None:
         self._model = model
+        self._reasoning_effort = reasoning_effort
         self._client = client or httpx.AsyncClient(timeout=30, http2=True)
         self._base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self._api_key = os.environ.get(api_key_env)
@@ -72,8 +74,16 @@ class OpenAIAdapter(TextAdapter):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
-            "max_tokens": max_tokens,
         }
+        # OpenAI's own API rejects `max_tokens` on newer models (gpt-6-*) and
+        # accepts `max_completion_tokens` on all of them. Other compatible
+        # endpoints (OpenRouter, Groq) may know only the older name.
+        if self._base_url == DEFAULT_BASE_URL:
+            payload["max_completion_tokens"] = max_tokens
+        else:
+            payload["max_tokens"] = max_tokens
+        if self._reasoning_effort:
+            payload["reasoning_effort"] = self._reasoning_effort
         if json_object:
             payload["response_format"] = {"type": "json_object"}
         started = time.perf_counter()

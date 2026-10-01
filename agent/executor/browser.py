@@ -30,6 +30,7 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeout,
 )
 
+from .cdp_relay import CdpTabRelay, resolve_cdp_url
 from .kinds import Action, NavigationInterrupted, Occluded, Outcome, StalePage
 from .motion import typing_delays
 from .screencast import Frame, FrameSink, decode, start_params
@@ -103,6 +104,9 @@ class PlaywrightExecutor:
         # never close a browser we did not launch.
         self._attached = False
         self._owns_page = True
+        # Set when attached through the one-tab relay (AGENT_CDP_URL=auto or
+        # AGENT_CHROME_PROFILE). The relay already opened the agent's tab.
+        self._relay: CdpTabRelay | None = None
 
     # ---- lifecycle ----------------------------------------------------------
 
@@ -137,14 +141,23 @@ class PlaywrightExecutor:
         # with `--remote-debugging-port=9222 --user-data-dir=...`, and we
         # open a new tab in that browser. Sites see a returning user.
         cdp_url = os.environ.get("AGENT_CDP_URL", "").strip()
+        profile = os.environ.get("AGENT_CHROME_PROFILE", "").strip()
         if cdp_url:
+            # A personal Chrome (many tabs, several profiles) goes through the
+            # relay: Playwright then sees only the one tab the relay opens.
+            if cdp_url.lower() == "auto" or profile:
+                self._relay = CdpTabRelay(resolve_cdp_url(cdp_url), profile=profile or None)
+                cdp_url = await self._relay.start()
             self._browser = await self._connect_cdp_with_retry(cdp_url)
             # An attached Chrome already has contexts and tabs. Reuse the
             # first context so we inherit the user's cookies; open a new
             # tab so the user's existing tabs are untouched.
             contexts = self._browser.contexts
             self._context = contexts[0] if contexts else await self._browser.new_context()
-            self._page = await self._context.new_page()
+            if self._relay is not None and self._context.pages:
+                self._page = self._context.pages[0]
+            else:
+                self._page = await self._context.new_page()
             self._attached = True
             self._owns_page = True
             # Emulate focus over CDP instead of `bring_to_front()`. Focus
@@ -229,6 +242,8 @@ class PlaywrightExecutor:
                     await self._browser.close()  # disconnects CDP; Chrome and the tab keep running
                 except Exception:  # noqa: BLE001
                     pass
+            if self._relay is not None:
+                await self._relay.close()
         else:
             if self._context is not None:
                 await self._context.close()

@@ -32,6 +32,9 @@ class ModelInfo:
     price_out_per_mtok: float
     context: int
     default: bool = False
+    # OpenAI reasoning models only. Without it, hidden reasoning can use the
+    # whole token limit and the reply comes back empty.
+    reasoning_effort: str | None = None
 
 
 REGISTRY: dict[str, ModelInfo] = {
@@ -127,6 +130,17 @@ REGISTRY: dict[str, ModelInfo] = {
         price_in_per_mtok=10.00,
         price_out_per_mtok=50.00,
         context=200_000,
+    ),
+    "gpt-6-luna": ModelInfo(
+        id="gpt-6-luna",
+        provider="openai",
+        api_model="gpt-6-luna",
+        modalities=("text",),
+        price_in_per_mtok=0.10,
+        price_out_per_mtok=0.50,
+        # Standard tier. Past 272K input tokens the long-context rate applies.
+        context=272_000,
+        reasoning_effort="low",
     ),
     # TypeSafe Jev — the constrained-choice policy
     "jev-latest": ModelInfo(
