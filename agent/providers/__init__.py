@@ -1,6 +1,6 @@
 """Model providers: registry, text adapters, and the Jev constrained-choice client."""
 
-from .jev import ChoiceAnswer, JevClient, JevError, JevOversized, JevResult
+from .jev import ChoiceAnswer, JevClient, JevError, JevOversized, JevResult, NoulAnswer
 from .registry import REGISTRY, Modality, ModelInfo, Provider, defaults, get, with_modality
 from .text import (
     AdapterError,
@@ -25,6 +25,7 @@ __all__ = [
     "JevResult",
     "Modality",
     "ModelInfo",
+    "NoulAnswer",
     "OpenAIAdapter",
     "Provider",
     "TextAdapter",

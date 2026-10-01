@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -31,17 +31,27 @@ class ChoiceAnswer:
 
 
 @dataclass(frozen=True, slots=True)
+class NoulAnswer:
+    """One answer for one yes/no question. `noul` is the probability of yes,
+    in [0, 1]. A Noul carries no confidence."""
+
+    noul: float
+
+
+@dataclass(frozen=True, slots=True)
 class JevResult:
     """A dict of `question_id -> ChoiceAnswer`, plus wire-level telemetry.
 
     The caller decides which questions to consume; head-selected answers can
-    be ignored without cost.
+    be ignored without cost. Noul questions (`"type": "noul"`) answer in
+    `nouls`, not `answers`, so choice consumers never meet a probability of yes.
     """
 
     answers: dict[str, ChoiceAnswer]
     model: str
     usage: dict[str, int]
     latency_ms: int
+    nouls: dict[str, NoulAnswer] = field(default_factory=dict)
 
 
 class JevError(RuntimeError):
@@ -84,6 +94,17 @@ def _validate(answer_raw: dict[str, Any], allowed: set[str]) -> ChoiceAnswer:
     )
 
 
+def _validate_noul(answer_raw: dict[str, Any]) -> NoulAnswer:
+    try:
+        value = answer_raw["noul"]
+    except (KeyError, TypeError):
+        raise JevError(f"Jev noul response missing keys; got {answer_raw!r}") from None
+    is_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if not is_number or not math.isfinite(value) or not 0 <= value <= 1:
+        raise JevError(f"Invalid Jev response (noul {value!r} not a number in [0,1])")
+    return NoulAnswer(noul=float(value))
+
+
 class JevClient:
     """One HTTP client per process. Safe to share across coroutines."""
 
@@ -115,9 +136,13 @@ class JevClient:
             raise JevError(f"Jev HTTP {response.status_code}: {detail}")
         result = response.json()
         answers: dict[str, ChoiceAnswer] = {}
+        nouls: dict[str, NoulAnswer] = {}
         for question_id, definition in questions.items():
             raw = result.get("answers", {}).get(question_id)
             if raw is None:
+                continue
+            if definition.get("type") == "noul":
+                nouls[question_id] = _validate_noul(raw)
                 continue
             allowed = set(definition["criteria"].keys())
             answers[question_id] = _validate(raw, allowed)
@@ -126,4 +151,79 @@ class JevClient:
             model=result.get("model") or self._model,
             usage=result.get("usage") or {},
             latency_ms=latency_ms,
+            nouls=nouls,
         )
+
+
+# ---- Inline tests: `uv run python -m agent.providers.jev` -----------------------------
+
+
+class NoulTestFailure(AssertionError):
+    """An inline Noul test saw the wrong result."""
+
+
+def _test_validate_noul() -> None:
+    """Unit: a Noul answer parses, and an out-of-range or missing value is rejected."""
+    if _validate_noul({"type": "noul", "noul": 0.95}).noul != 0.95:
+        raise NoulTestFailure("a valid noul did not parse to 0.95")
+    for bad in ({"noul": 1.5}, {"noul": "yes"}, {"noul": True}, {"noul": float("nan")}, {}):
+        try:
+            _validate_noul(bad)
+        except JevError:
+            continue
+        raise NoulTestFailure(f"invalid noul accepted: {bad!r}")
+
+
+async def _test_ask_mixed_mocked() -> None:
+    """End to end, mocked server: one request with a Choice and a Noul fills both maps."""
+    os.environ.setdefault("TYPESAFE_API_KEY", "test")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "model": "jev-1.13.0",
+            "answers": {
+                "operation": {"type": "choice", "choice": "DONE",
+                              "probabilities": {"DONE": 0.9, "WAIT": 0.1}, "confidence": 0.8},
+                "goal_met": {"type": "noul", "noul": 0.97},
+            },
+            "usage": {"input_tokens": 10, "output_tokens": 0},
+        })
+
+    client = JevClient(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    result = await client.ask(state={}, questions={
+        "operation": {"type": "choice", "criteria": {"DONE": "", "WAIT": ""}},
+        "goal_met": {"type": "noul", "instructions": "Is the goal met?"},
+    })
+    if result.answers["operation"].choice != "DONE" or "goal_met" in result.answers:
+        raise NoulTestFailure(f"choice map wrong: {result.answers!r}")
+    if result.nouls["goal_met"].noul != 0.97:
+        raise NoulTestFailure(f"noul map wrong: {result.nouls!r}")
+
+
+async def _test_ask_mixed_live() -> None:
+    """End to end, live API: a Choice and a Noul in one request both come back valid.
+    Skipped when TYPESAFE_API_KEY is not set. Costs a fraction of a cent."""
+    if os.environ.get("TYPESAFE_API_KEY", "test") == "test":
+        print("skip: live test needs TYPESAFE_API_KEY")
+        return
+    result = await JevClient().ask(
+        state={"page": {"title": "Your cart", "text": "Cart: 1 item. Banana, $0.30. Subtotal $0.30."}},
+        questions={
+            "operation": {"type": "choice", "instructions": "Goal: add a banana to the cart. What next?",
+                          "criteria": {"DONE": "The goal is visibly met.", "WAIT": "Wait for the page."}},
+            "goal_met": {"type": "noul",
+                         "instructions": "Does `page` show that a banana is in the cart?"},
+        },
+    )
+    if "operation" not in result.answers or not 0 <= result.nouls["goal_met"].noul <= 1:
+        raise NoulTestFailure(f"live mixed request wrong: {result!r}")
+    print(f"live: operation={result.answers['operation'].choice} goal_met={result.nouls['goal_met'].noul:.2f}")
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    _test_validate_noul()
+    asyncio.run(_test_ask_mixed_live())  # before the mocked test, which may set a dummy key
+    asyncio.run(_test_ask_mixed_mocked())
+    print("jev.py inline tests passed")
