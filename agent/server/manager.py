@@ -193,6 +193,13 @@ class RunManager:
                 run.started = True
                 start_url = plan.start_url if plan is not None else run.start_url
                 run.state = await supervisor.run(start_url)
+                # The run's totals, once, for the UI's results card: the
+                # heartbeat above is the only other budget event.
+                budget = run.state.budget
+                run.bus.publish(BudgetEvent(
+                    run_id=run.run_id, seq=await run.bus.next_seq(),
+                    steps=budget.steps, model_ms=budget.model_ms, load_ms=budget.load_ms, usd=budget.usd,
+                ))
                 await executor.stop_screencast()
                 log.debug("run %s: finished", run.run_id)
         except asyncio.CancelledError:

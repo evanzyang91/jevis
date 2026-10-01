@@ -19,6 +19,14 @@ export type ObservationEvent = EventBase & {
   fingerprint: string;
   element_count: number;
   text_preview: string;
+  marker?: string;
+  scroll_y?: number;
+  scroll_area?: string;
+  loading?: boolean;
+  viewport_w?: number;
+  viewport_h?: number;
+  // [index, role, label] per element; the index matches a target id's digits ("c9" -> 9).
+  elements?: [number, string, string][];
 };
 
 export type DecisionEvent = EventBase & {
@@ -31,6 +39,17 @@ export type DecisionEvent = EventBase & {
   latency_ms: number;
   model: string;
   remembered: boolean;
+  banned?: string[];
+  offered?: Record<string, string[]>;
+  dialog?: string;
+  dialog_p?: number;
+  signal?: number;
+  check?: string;
+  check_p?: number;
+  check_switch?: string;
+  switched?: boolean;
+  escalate?: boolean;
+  guidance?: string;
 };
 
 export type ActionEvent = EventBase & {

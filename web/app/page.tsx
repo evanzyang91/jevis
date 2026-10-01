@@ -1,356 +1,331 @@
 "use client";
 
-// End-user route (Section 6 BrowserFrame). Two phases: composer, active.
-// Active view keeps the last frame on-screen so the person can inspect the
-// end state; the primary action swaps from Stop run to Start another task
-// when the status is terminal.
+// End-user route. A conversation, not a dashboard: one question and a box
+// before the first request; afterwards each request is a turn that narrates
+// what the agent did, with the live browser beside it. The developer view
+// opens underneath with the decision inspector and the decision trail.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { CaptchaBanner } from "@/components/CaptchaBanner";
-import { Composer } from "@/components/Composer";
-import { CursorLayer } from "@/components/CursorLayer";
-import { PlanView } from "@/components/PlanView";
-import { ScreencastFrame } from "@/components/ScreencastFrame";
-import type {
-  CaptchaEvent,
-  CursorClickEvent,
-  CursorMoveEvent,
-  CursorScrollEvent,
-  FocusPulseEvent,
-  FrameEvent,
-  KeystrokeEvent,
-  PlanEvent,
-  StreamEvent,
-} from "@/lib/events";
+import { DevDrawer } from "@/components/home/DevDrawer";
+import { Turn } from "@/components/home/Turn";
+import { type CursorEvent, isCursorEvent } from "@/components/home/cursor";
+import type { FrameEvent } from "@/lib/events";
+import { type Run, isTerminal, newRun, reduce, seconds } from "@/lib/run";
+import { useVoice } from "@/lib/voice";
+import { subscribeEvents, subscribeFrames } from "@/lib/ws";
 
-type CursorEvent =
-  | CursorMoveEvent
-  | CursorClickEvent
-  | CursorScrollEvent
-  | FocusPulseEvent
-  | KeystrokeEvent;
-import { type SocketState, subscribeEvents, subscribeFrames } from "@/lib/ws";
+import "./home.css";
 
-type Phase = "composer" | "active";
-type Lifecycle = "starting" | "running" | "paused" | "done" | "blocked" | "error";
+const EXAMPLES = [
+  "Add the ingredients for a chocolate cake to my cart",
+  "Find a highly rated wireless mouse under $50",
+  "Open the Wikipedia article on Gödel's incompleteness theorems",
+];
 
-type RunResponse = { run_id: string };
-
-const TERMINAL: readonly Lifecycle[] = ["done", "blocked", "error"];
-
-const STATUS_TEXT: Record<Lifecycle, string> = {
-  starting: "Queued",
-  running: "Running",
-  paused: "Needs you",
-  done: "Done",
-  blocked: "Stopped",
-  error: "Failed",
+const STATUS_LINE: Record<Run["status"], string> = {
+  starting: "Planning the task and opening the browser…",
+  running: "Running…",
+  paused: "Paused · needs you",
+  done: "Finished. Check the result.",
+  blocked: "Stopped. It could not find a way forward.",
+  error: "Paused · needs attention",
 };
 
-const STATUS_TONE: Record<Lifecycle, string> = {
-  starting: "muted",
-  running: "running",
-  paused: "needs-you",
-  done: "done",
-  blocked: "muted",
-  error: "failed",
-};
+const THEME_KEY = "agent-theme";
+const DEV_KEY = "agent-dev-view";
 
-const LIVE_TONE = (lifecycle: Lifecycle): "live" | "paused" | "off" => {
-  if (lifecycle === "running") return "live";
-  if (lifecycle === "paused") return "paused";
-  return "off";
+const remember = (key: string, value: string) => {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Private mode or blocked storage: the setting lasts for this page only.
+  }
 };
-
-const formatElapsed = (ms: number | null): string => {
-  if (ms === null || ms < 0) return "—";
-  const total = Math.floor(ms / 100) / 10; // 0.1s precision
-  if (total < 60) return `${total.toFixed(1)}s`;
-  const mins = Math.floor(total / 60);
-  const secs = Math.floor(total - mins * 60);
-  return `${mins}:${secs.toString().padStart(2, "0")}`;
+const recall = (key: string) => {
+  try {
+    return localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
 };
 
 export default function Home() {
-  const [phase, setPhase] = useState<Phase>("composer");
-  const [runId, setRunId] = useState<string | null>(null);
-  const [plan, setPlan] = useState<PlanEvent | null>(null);
+  const [runs, setRuns] = useState<Run[]>([]);
   const [frame, setFrame] = useState<FrameEvent | null>(null);
-  const [captcha, setCaptcha] = useState<CaptchaEvent | null>(null);
-  const [lifecycle, setLifecycle] = useState<Lifecycle>("starting");
-  const [statusReason, setStatusReason] = useState<string>("");
-  const [cost, setCost] = useState<number>(0);
-  const [currentUrl, setCurrentUrl] = useState<string>("");
-  const [eventsState, setEventsState] = useState<SocketState>("closed");
-  const [framesState, setFramesState] = useState<SocketState>("closed");
-  const [eventCount, setEventCount] = useState(0);
-  const [frameCount, setFrameCount] = useState(0);
-  const [lastKind, setLastKind] = useState<string>("");
-  // Run-wall-clock stopwatch. `startedAt` is null until the first event
-  // arrives (or lifecycle becomes running). `frozenMs` is set when the run
-  // reaches a terminal state so the counter stops incrementing.
-  const [startedAt, setStartedAt] = useState<number | null>(null);
-  const startedAtRef = useRef<number | null>(null);
-  const [frozenMs, setFrozenMs] = useState<number | null>(null);
-  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [goal, setGoal] = useState("");
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [dev, setDev] = useState(false);
+  const [theme, setTheme] = useState<"" | "light" | "dark">("");
+  const [models, setModels] = useState<string[]>([]);
+  const [model, setModel] = useState("");
+  const [, tick] = useState(0);
+  const goalBox = useRef<HTMLTextAreaElement | null>(null);
+  const thread = useRef<HTMLDivElement | null>(null);
+  const cursorHandlers = useRef<Set<(event: CursorEvent) => void>>(new Set());
 
-  const cursorSubscribers = useRef<Set<(event: CursorEvent) => void>>(new Set());
+  const current = runs.length ? runs[runs.length - 1] : null;
+  const running = !!current && !isTerminal(current);
 
-  const registerCursorHandler = useCallback(
-    (handler: (event: CursorEvent) => void) => {
-      cursorSubscribers.current.add(handler);
-      return () => {
-        cursorSubscribers.current.delete(handler);
-      };
-    },
-    [],
-  );
-
-  const resetRunState = () => {
-    setPlan(null);
-    setFrame(null);
-    setCaptcha(null);
-    setLifecycle("starting");
-    setStatusReason("");
-    setCost(0);
-    setCurrentUrl("");
-    setEventCount(0);
-    setFrameCount(0);
-    setLastKind("");
-    setEventsState("closed");
-    setFramesState("closed");
-    setStartedAt(null);
-    startedAtRef.current = null;
-    setFrozenMs(null);
-  };
-
+  // Settings remembered across visits, read after mount so the server render matches.
   useEffect(() => {
-    if (!runId) return;
-    const stopEvents = subscribeEvents(
-      runId,
-      (event) => {
-        setEventCount((prior) => prior + 1);
-        setLastKind(event.kind);
-        if (startedAtRef.current == null) {
-          startedAtRef.current = Date.now();
-          setStartedAt(startedAtRef.current);
-        }
-        if (event.kind === "plan") setPlan(event);
-        if (event.kind === "captcha") setCaptcha(event);
-        if (event.kind === "budget") setCost(event.usd);
-        if (event.kind === "observation") setCurrentUrl(event.url);
-        if (event.kind === "outcome") setLifecycle("running");
-        if (event.kind === "error") {
-          setLifecycle("error");
-          setStatusReason(`${event.layer}: ${event.message}`);
-        }
-        if (event.kind === "status") {
-          setLifecycle(event.status);
-          setStatusReason(event.reason);
-          if (event.status === "done" || event.status === "blocked" || event.status === "error") {
-            setFrozenMs((prior) => prior ?? (startedAtRef.current ? Date.now() - startedAtRef.current : 0));
-          }
-        }
-        if (
-          event.kind === "cursor_move" ||
-          event.kind === "cursor_click" ||
-          event.kind === "cursor_scroll" ||
-          event.kind === "focus_pulse" ||
-          event.kind === "keystroke"
-        ) {
-          const cursorEvent = event as CursorEvent;
-          cursorSubscribers.current.forEach((handler) => handler(cursorEvent));
-        }
-      },
-      setEventsState,
-    );
-    const stopFrames = subscribeFrames(
-      runId,
-      (nextFrame) => {
-        setFrame(nextFrame);
-        setFrameCount((prior) => prior + 1);
-      },
-      setFramesState,
-    );
+    setDev(recall(DEV_KEY) === "1");
+    const saved = recall(THEME_KEY);
+    setTheme(saved === "light" || saved === "dark" ? saved : "");
+    fetch("/api/models")
+      .then((r) => r.json())
+      .then((data: { models: { id: string; modalities: string[] }[] }) => {
+        // Writers only: Jev is the policy, not a text model. An empty choice
+        // sends no model, so the server's TEXT_MODEL applies.
+        setModels(data.models.filter((m) => m.modalities.includes("text") && !m.id.startsWith("jev")).map((m) => m.id));
+      })
+      .catch(() => setError("Cannot reach the agent server. Start it with `uv run agent`."));
+  }, []);
+
+  const cursor = useCallback((handler: (event: CursorEvent) => void) => {
+    cursorHandlers.current.add(handler);
+    return () => {
+      cursorHandlers.current.delete(handler);
+    };
+  }, []);
+
+  // The newest run streams; older turns are already final.
+  const liveId = current?.id ?? null;
+  useEffect(() => {
+    if (!liveId) return;
+    const stopEvents = subscribeEvents(liveId, (event) => {
+      if (isCursorEvent(event)) cursorHandlers.current.forEach((handler) => handler(event));
+      setRuns((prior) => prior.map((run) => (run.id === liveId ? reduce(run, event) : run)));
+    });
+    const stopFrames = subscribeFrames(liveId, setFrame);
     return () => {
       stopEvents();
       stopFrames();
     };
-  }, [runId]);
+  }, [liveId]);
 
-  // Stopwatch tick. Only run the interval while there's an active,
-  // non-frozen run — otherwise we'd re-render the whole tree every 100ms
-  // for nothing.
+  // The header clock moves while a run is going.
   useEffect(() => {
-    if (startedAt === null || frozenMs !== null) return;
-    const id = window.setInterval(() => setNowMs(Date.now()), 100);
+    if (!running) return;
+    const id = window.setInterval(() => tick((n) => n + 1), 100);
     return () => window.clearInterval(id);
-  }, [startedAt, frozenMs]);
+  }, [running]);
 
-  const onStart = async (goal: string, url: string) => {
-    resetRunState();
-    setRunId(null);
-    const response = await fetch("/api/runs", {
+  useEffect(() => {
+    const box = thread.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [runs]);
+
+  const grow = () => {
+    const box = goalBox.current;
+    if (!box) return;
+    box.style.height = "auto";
+    box.style.height = `${Math.min(box.scrollHeight, 200)}px`;
+  };
+  useEffect(grow, [goal]);
+
+  const voice = useVoice(() => goal, setGoal);
+
+  const start = async () => {
+    const request = goal.trim();
+    if (!request || busy || running) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch("/api/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ goal: request, url: url.trim(), ...(model ? { text_model: model } : {}) }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || data.error || "The agent server refused the task.");
+      setFrame(null);
+      setRuns((prior) => [...prior, newRun(data.run_id, request)]);
+      setGoal("");
+      remember("agent.lastRunId", data.run_id); // the full inspector at /dev opens this run
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stop = async () => {
+    if (!current) return;
+    await fetch(`/api/runs/${current.id}/stop`, { method: "POST" });
+  };
+
+  const resumeCaptcha = async () => {
+    if (!current?.captcha) return;
+    await fetch(`/api/runs/${current.id}/resume-captcha`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ goal, url }),
+      body: JSON.stringify({ resume_token: current.captcha.resume_token }),
     });
-    const data: RunResponse = await response.json();
-    setRunId(data.run_id);
-    // Share with /dev so opening it in a new tab auto-loads this run.
-    try {
-      localStorage.setItem("agent.lastRunId", data.run_id);
-    } catch {
-      // localStorage can throw in private mode; not fatal.
-    }
-    setPhase("active");
   };
 
-  const backToComposer = () => {
-    resetRunState();
-    setRunId(null);
-    setPhase("composer");
+  const toggleDev = (on: boolean) => {
+    setDev(on);
+    remember(DEV_KEY, on ? "1" : "");
   };
 
-  const stopRun = async () => {
-    if (runId) await fetch(`/api/runs/${runId}/stop`, { method: "POST" });
-    setLifecycle("blocked");
-    setStatusReason("Stopped by you.");
+  // Follow the system unless the reader says otherwise, and remember that choice.
+  const toggleTheme = () => {
+    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const now = theme || (dark ? "dark" : "light");
+    const next = now === "dark" ? "light" : "dark";
+    setTheme(next);
+    remember(THEME_KEY, next);
   };
 
-  const terminal = TERMINAL.includes(lifecycle);
-  const captureW = frame?.capture_w ?? 1280;
-  const captureH = frame?.capture_h ?? 800;
+  const elapsed = current ? (current.endedAt ?? Date.now()) - current.startedAt : 0;
+  const modelMs = current ? current.budget?.model_ms ?? current.modelMs : 0;
 
   return (
-    <main
-      style={{
-        width: "min(var(--size-content), calc(100vw - var(--space-8)))",
-        margin: "var(--space-8) auto",
-        padding: "0 var(--space-4)",
-        display: "grid",
-        gap: "var(--space-6)",
-      }}
+    <div
+      className={`wa ${dev ? "dev" : ""} ${runs.length ? "" : "idle"} ${running ? "running" : ""}`}
+      data-theme={theme || undefined}
     >
-      <header style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-        <h1 className="fj-title" style={{ margin: 0 }}>Agent</h1>
-        <a href="/dev" className="fj-small" style={{ color: "var(--ink-muted)" }}>Dev</a>
+      <header>
+        <div className="brand-space" />
+        <div className="header-right">
+          {current && <span className="elapsed">{seconds(elapsed)}</span>}
+          {current && dev && <span className="elapsed model">model {seconds(modelMs)}</span>}
+          <button type="button" className="icon small" aria-label="Switch theme" title="Switch theme" onClick={toggleTheme}>
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <circle cx="12" cy="12" r="4.2" />
+              <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" />
+            </svg>
+          </button>
+          <label className="mode">
+            <input type="checkbox" checked={dev} onChange={(e) => toggleDev(e.target.checked)} /> Developer
+          </label>
+        </div>
       </header>
 
-      {phase === "composer" && (
-        <div style={{ maxWidth: 640 }}>
-          <Composer onStart={onStart} />
-        </div>
-      )}
-
-      {phase === "active" && (
-        <section style={{ display: "grid", gap: "var(--space-4)" }}>
-          <div className="fj-browser">
-            <div className="fj-browser-toolbar">
-              <LiveSignal tone={LIVE_TONE(lifecycle)} />
-              <div className="fj-browser-url" title={currentUrl}>
-                {currentUrl || "—"}
+      <main>
+        <div className="thread" ref={thread}>
+          {runs.length === 0 ? (
+            <div className="intro">
+              <h1>What should I do on the web?</h1>
+              <p className="sub">Describe a task in your own words. I&apos;ll open a browser and do it while you watch.</p>
+              <div className="examples">
+                {EXAMPLES.map((example) => (
+                  <button
+                    key={example}
+                    type="button"
+                    className="example"
+                    onClick={() => {
+                      setGoal(example);
+                      goalBox.current?.focus();
+                    }}
+                  >
+                    {example}
+                  </button>
+                ))}
               </div>
-              {!terminal && (
-                <button type="button" className="fj-btn fj-btn-sm fj-btn-danger" onClick={stopRun}>
-                  Stop run
-                </button>
-              )}
             </div>
-            <div
-              className="fj-browser-viewport"
-              style={{ aspectRatio: `${captureW} / ${captureH}` }}
-            >
-              <ScreencastFrame frame={frame} />
-              <CursorLayer
-                captureW={captureW}
-                captureH={captureH}
-                onEvent={registerCursorHandler}
+          ) : (
+            runs.map((run) => (
+              <Turn
+                key={run.id}
+                run={run}
+                frame={run.id === liveId ? frame : null}
+                showBrowser={run.id === liveId && !dev}
+                cursor={cursor}
+                onResumeCaptcha={resumeCaptcha}
               />
-            </div>
-          </div>
-
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "var(--space-4)" }}>
-            <div className="fj-status" data-tone={STATUS_TONE[lifecycle]}>
-              <span>{STATUS_TEXT[lifecycle]}</span>
-              {statusReason && (
-                <span className="fj-small" style={{ color: "var(--ink-muted)" }}>
-                  · {statusReason}
-                </span>
-              )}
-            </div>
-            <div className="fj-small fj-num" style={{ color: "var(--ink-muted)", display: "flex", gap: "var(--space-3)" }}>
-              <span title="Elapsed run time">{formatElapsed(frozenMs ?? (startedAt ? nowMs - startedAt : null))}</span>
-              <span>·</span>
-              <span>${cost.toFixed(4)}</span>
-            </div>
-          </div>
-
-          {plan && <PlanView plan={plan.plan} activeIndex={plan.active_index} />}
-
-          {captcha && !terminal && (
-            <CaptchaBanner
-              runId={runId ?? ""}
-              reason={captcha.reason}
-              resumeToken={captcha.resume_token}
-              onResumed={() => setCaptcha(null)}
-            />
+            ))
           )}
+        </div>
 
-          {terminal && (
-            <div>
-              <button type="button" className="fj-btn fj-btn-primary" onClick={backToComposer}>
-                Start another task
+        <div className="composer-wrap">
+          {error && (
+            <div className="error-box" role="alert">
+              {error}
+            </div>
+          )}
+          <form
+            className="composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              start();
+            }}
+          >
+            <textarea
+              ref={goalBox}
+              className="goal"
+              rows={1}
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              onKeyDown={(event) => {
+                // Enter sends, Shift+Enter makes a new line — the convention everywhere else.
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  start();
+                }
+              }}
+              placeholder="Ask anything, or press the microphone to speak…"
+              aria-label="Task"
+            />
+            <div className="composer-tools">
+              <input
+                className="url-input"
+                type="text"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="Start on a site (optional)"
+                aria-label="Starting site, optional"
+                spellCheck={false}
+              />
+              <span className="tool-spacer" />
+              <button
+                type="button"
+                className={`mic ${voice.supported ? "" : "off"} ${voice.listening ? "listening" : ""}`}
+                aria-label="Speak your request"
+                title={voice.supported ? "Speak your request" : "This browser has no speech recognition"}
+                onClick={voice.toggle}
+              >
+                <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+                  <path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" />
+                  <path d="M19 11a7 7 0 0 1-14 0M12 18v3" />
+                </svg>
+                <span>{voice.listening ? "Listening" : "Speak"}</span>
+              </button>
+              <button type="submit" className="send" aria-label="Start" disabled={busy || running || !goal.trim()}>
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                  <path d="M12 19V5M5 12l7-7 7 7" />
+                </svg>
               </button>
             </div>
-          )}
+          </form>
+          {voice.message && <p className="hint">{voice.message}</p>}
+          <div className="run-controls">
+            {running && (
+              <button type="button" className="ghost" onClick={stop}>
+                Stop
+              </button>
+            )}
+            <span className="status-line" role="status">
+              {busy ? "Sending the task…" : current ? STATUS_LINE[current.status] : ""}
+            </span>
+          </div>
+        </div>
 
-          <details className="fj-panel fj-panel-pad" style={{ padding: "var(--space-3) var(--space-4)" }}>
-            <summary className="fj-small" style={{ cursor: "pointer", color: "var(--ink-muted)" }}>
-              Details
-            </summary>
-            <div style={{ marginTop: "var(--space-3)", display: "grid", gap: "var(--space-2)" }} className="fj-small">
-              <Row label="Run" value={runId ?? "—"} />
-              <Row label="Events" value={`${eventsState} · ${eventCount}`} />
-              <Row label="Frames" value={`${framesState} · ${frameCount}`} />
-              <Row label="Last event" value={lastKind || "—"} />
-              {plan?.original_goal && <Row label="Original goal" value={plan.original_goal} />}
-              {plan?.refined_goal && <Row label="Refined goal" value={plan.refined_goal} />}
-              {plan?.start_url && <Row label="Start URL" value={plan.start_url} />}
-              {plan?.plan?.length ? (
-                <div>
-                  <div className="fj-label" style={{ marginTop: "var(--space-2)" }}>Subgoals</div>
-                  <ol style={{ margin: "var(--space-2) 0 0", paddingLeft: "var(--space-5)" }}>
-                    {plan.plan.map((s, i) => (
-                      <li key={i} style={{ margin: "var(--space-1) 0" }}>{s}</li>
-                    ))}
-                  </ol>
-                </div>
-              ) : null}
-            </div>
-          </details>
-        </section>
-      )}
-    </main>
-  );
-}
-
-function LiveSignal({ tone }: { tone: "live" | "paused" | "off" }) {
-  const label = tone === "live" ? "Live" : tone === "paused" ? "Paused" : "Disconnected";
-  return (
-    <span className="fj-small" style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-2)", color: "var(--ink-muted)" }}>
-      <span className="fj-dot" data-tone={tone} />
-      {label}
-    </span>
-  );
-}
-
-function Row({ label, value }: { label: string; value: string }) {
-  return (
-    <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: "var(--space-3)" }}>
-      <span className="fj-label">{label}</span>
-      <span style={{ wordBreak: "break-all" }}>{value}</span>
+        {dev && (
+          <DevDrawer
+            run={current}
+            frame={frame}
+            cursor={cursor}
+            models={models}
+            model={model}
+            onModel={setModel}
+            busy={running}
+          />
+        )}
+      </main>
     </div>
   );
 }
