@@ -7,6 +7,7 @@ question: given this observation and this goal, what is the next action?
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -15,11 +16,22 @@ from agent.perception import Observation
 from agent.providers import JevClient, JevError, JevOversized
 
 from .action_space import ActionSpace, build, resolve, summarise
-from .prompts import DIALOG_KIND, DIALOG_KINDS, NEXT_ACTION, TARGET
+from .prompts import DIALOG_KIND, DIALOG_KINDS, NEXT_ACTION, STEP_CHECK, TARGET
 
 MAX_ACTION_SPACE = 60
 # Below this the dialog's diagnosis is not sent, and rule 1 applies as written.
 DIALOG_KIND_MIN = 0.6
+# The step check runs when the grouped signal is below CHECK_TRIGGER, or below
+# CHECK_TERMINAL for DONE and BLOCKED, which end the run. A candidate passes at
+# CHECK_PASS. Tuned offline on 84 labelled steps (2026-10-01); log-only for now.
+CHECK_TRIGGER = 0.5
+CHECK_TERMINAL = 0.8
+CHECK_PASS = 0.7
+CHECK_CANDIDATES = 3
+# Route words that do not change which item a control acts on: "Eggs" and
+# "Add to cart - Eggs" are one decision. A favourites or sign-in control is not.
+_ROUTE_PREFIX = re.compile(r"^(add to cart|add item to cart|add to order|loading)\b\s*-?\s*", re.I)
+_TRAILING_PRICE = re.compile(r"\s*(ca)?\$[\d.,]+$", re.I)
 
 
 def _operations_for(element) -> list[str]:  # noqa: ANN001
@@ -105,6 +117,14 @@ class Decision:
     # The open modal's diagnosis, when one was sent to the policy.
     dialog: str | None = None
     dialog_p: float = 0.0
+    # Confidence with "X" and "Add to cart - X" counted as one decision.
+    signal: float = 1.0
+    # The step check, when it ran: "cleared" or "failed". `check_p` is the best
+    # candidate's score; `check_switch` names it when it is not the policy's pick.
+    # Log-only: the action above is always the policy's own pick.
+    check: str | None = None
+    check_p: float = 0.0
+    check_switch: str | None = None
 
 
 def _reduced(space: ActionSpace, keep: int) -> ActionSpace:
@@ -252,6 +272,25 @@ async def decide(
         )
         if surviving:
             offered[op.id] = surviving
+    # Candidates as the check reads them: the policy's pick first, then the
+    # next most likely, from whichever head decided this step.
+    if target is not None:
+        labels = {t.id: t.label for t in space.by_id(operation).targets}
+        ranked = sorted(probabilities.items(), key=lambda item: -item[1])
+        candidates = [(labels.get(key, key), p) for key, p in ranked]
+        chosen_label = labels.get(target, target)
+    else:
+        op_labels = {op.id: op.label for op in space.operations}
+        ranked = sorted(operation_answer.probabilities.items(), key=lambda item: -item[1])
+        candidates = [(f"{key}: {op_labels.get(key, key)}", p) for key, p in ranked]
+        chosen_label = f"{operation}: {op_labels.get(operation, operation)}"
+    signal = grouped_signal(operation_answer.confidence, chosen_label if target else None, candidates)
+    check = None
+    if signal < CHECK_TRIGGER or (operation in {"DONE", "BLOCKED"} and signal < CHECK_TERMINAL):
+        shortlist = [chosen_label] + [label for label, _ in candidates if label != chosen_label]
+        check = await check_step(client=client, goal=goal, page=state["page"],
+                                 recent_actions=state["recent_actions"],
+                                 candidates=shortlist[:CHECK_CANDIDATES])
     return Decision(
         operation=operation,
         target=target,
@@ -260,11 +299,94 @@ async def decide(
         probabilities=probabilities,
         model=result.model,
         latency_ms=result.latency_ms,
-        usage=_usage_sum(result.usage, diagnosis[2] if diagnosis else {}),
+        usage=_usage_sum(result.usage, diagnosis[2] if diagnosis else {}, check.usage if check else {}),
         offered=offered,
         dialog=dialog,
         dialog_p=diagnosis[1] if dialog and diagnosis else 0.0,
+        signal=signal,
+        check=check.verdict if check else None,
+        check_p=check.best_p if check else 0.0,
+        check_switch=check.switch if check else None,
     )
+
+
+def _item_of(label: str) -> str:
+    """The item a control acts on, with route words and a trailing price removed."""
+    return _TRAILING_PRICE.sub("", _ROUTE_PREFIX.sub("", label.strip())).strip().lower()
+
+
+def grouped_signal(op_confidence: float, chosen: str | None, candidates: list[tuple[str, float]]) -> float:
+    """How sure the policy is of its decision, not of one control.
+
+    Probability split between "Eggs" and "Add to cart - Eggs" is one decision
+    taken two ways, so their probabilities add. Probability split between
+    different items, or different operations, stays split. `chosen` is None
+    for an operation with no target: then only the operation head counts."""
+    if chosen is None:
+        return op_confidence
+    item = _item_of(chosen)
+    same = sum(p for label, p in candidates if _item_of(label) == item)
+    return min(op_confidence, same)
+
+
+@dataclass(frozen=True, slots=True)
+class StepCheck:
+    """One step check. `verdict` is "cleared" when the best candidate scores at
+    least CHECK_PASS, else "failed". `switch` names the best candidate when it is
+    not the policy's pick (candidates[0])."""
+
+    verdict: str
+    best_p: float
+    switch: str | None
+    scores: tuple[float, ...]
+    usage: Mapping[str, int]
+
+
+async def check_step(
+    *, client: JevClient, goal: str, page: Mapping[str, Any], recent_actions: list[dict[str, Any]],
+    candidates: list[str],
+) -> StepCheck | None:
+    """Ask Jev whether each candidate is a reasonable next step: one Noul each,
+    in one request. A Choice is relative and says which option is best; a Noul
+    is absolute and says whether an option is acceptable at all, so it tells
+    "several good options" apart from "no good option". None when Jev fails —
+    the check is advisory and must never stop a decision."""
+    state = {
+        "goal": goal,
+        "page": {"url": page.get("url", ""), "title": page.get("title", "")},
+        "recent_actions": recent_actions,
+        "candidates": candidates,
+    }
+    questions = {
+        f"c{j}": {"type": "noul", "instructions": {
+            "question": STEP_CHECK["question"].replace("{candidate}", f"`candidates[{j}]`"),
+            "rules": STEP_CHECK["rules"]}}
+        for j in range(len(candidates))
+    }
+    try:
+        result = await client.ask(state=state, questions=questions)
+    except JevError:
+        return None
+    scores = tuple(result.nouls[f"c{j}"].noul if f"c{j}" in result.nouls else 0.0 for j in range(len(candidates)))
+    best = max(range(len(scores)), key=lambda j: scores[j])
+    passed = scores[best] >= CHECK_PASS
+    return StepCheck(
+        verdict="cleared" if passed else "failed",
+        best_p=scores[best],
+        switch=candidates[best] if passed and best != 0 else None,
+        scores=scores,
+        usage=dict(result.usage),
+    )
+
+
+def should_escalate(decision: Decision, previous_check_failed: bool) -> bool:
+    """Escalate a failed check only when it is not a one-off: the previous step
+    failed too, or this step ends the run (DONE, BLOCKED), which leaves no next
+    step to wait for. One-off doubts on good runs cost an LLM call each and were
+    harmless in every logged case; repeated doubt is how stuck runs look."""
+    if decision.check != "failed":
+        return False
+    return previous_check_failed or decision.operation in {"DONE", "BLOCKED"}
 
 
 def _usage_sum(*usages: Mapping[str, int]) -> dict[str, int]:
@@ -388,9 +510,121 @@ async def _e2e_live() -> None:
         raise DialogTestFailure("policy closed the task dialog")
 
 
+class CheckTestFailure(AssertionError):
+    """An inline step-check test saw the wrong result."""
+
+
+_SUGAR = ("Rogers Fine Granulated Sugar 4kg", "Add to cart - Rogers Fine Granulated Sugar 4kg",
+          "Sign in to add to Favourites list, Rogers Fine Granulated Sugar 4kg")
+
+
+def _sugar_page() -> Observation:
+    from agent.perception import Element, Rect
+
+    elements = tuple(Element(ref=f"[data-agent-ref=e{i}]", role="button", name=name,
+                             bounds=Rect(100, 100 + 50 * i, 300, 40), section="main")
+                     for i, name in enumerate(_SUGAR))
+    return Observation(url="https://www.walmart.ca/en/search?q=granulated+sugar", title="granulated sugar",
+                       text="Rogers Fine Granulated Sugar 4kg $7.47", elements=elements, marker="m",
+                       fingerprint="f", guards={}, can_go_back=True, can_scroll_up=False, can_scroll_down=True,
+                       viewport=(1280, 800))
+
+
+class _SplitJev:
+    """Answers CLICK at `op_conf`, the targets with `target_probs`, and any step
+    check with `check_scores`. Counts the check requests."""
+
+    def __init__(self, op_conf: float, target_probs: list[float], check_scores: list[float]) -> None:
+        self.op_conf, self.target_probs, self.check_scores = op_conf, target_probs, check_scores
+        self.checks = 0
+
+    async def ask(self, *, state: dict[str, Any], questions: dict[str, Any]):  # noqa: ANN201
+        from agent.providers import ChoiceAnswer, JevResult, NoulAnswer
+
+        if "c0" in questions:
+            self.checks += 1
+            nouls = {f"c{j}": NoulAnswer(noul=v) for j, v in enumerate(self.check_scores)}
+            return JevResult(answers={}, model="stand-in", usage={"input_tokens": 50}, latency_ms=0, nouls=nouls)
+        ops = questions["operation"]["criteria"]
+        rest = (1 - self.op_conf) / max(1, len(ops) - 1)
+        op = ChoiceAnswer(choice="CLICK", probabilities={k: self.op_conf if k == "CLICK" else rest for k in ops},
+                          confidence=self.op_conf)
+        ids = list(questions["click_target"]["criteria"])
+        probs = dict(zip(ids, self.target_probs))
+        tgt = ChoiceAnswer(choice=max(probs, key=probs.get), probabilities=probs, confidence=max(probs.values()))
+        return JevResult(answers={"operation": op, "click_target": tgt}, model="stand-in",
+                         usage={"input_tokens": 1000}, latency_ms=0)
+
+
+async def _check_unit_tests() -> None:
+    goal = "Search 'granulated sugar' and add one bag to the cart. Do not place the order."
+    # Gap 1: one item's routes count as one decision; a favourites detour does not.
+    signal = grouped_signal(0.9, _SUGAR[0], [(_SUGAR[0], 0.40), (_SUGAR[1], 0.35), (_SUGAR[2], 0.25)])
+    if abs(signal - 0.75) > 1e-9:
+        raise CheckTestFailure(f"routes not grouped: {signal}")
+    if grouped_signal(0.9, _SUGAR[2], [(_SUGAR[0], 0.40), (_SUGAR[1], 0.35), (_SUGAR[2], 0.25)]) != 0.25:
+        raise CheckTestFailure("favourites detour was grouped with the item")
+    # Gap 2: no check when the grouped signal is high (0.40 + 0.35 = 0.75).
+    jev = _SplitJev(0.9, [0.40, 0.35, 0.25], [0.9, 0.9, 0.1])
+    decision = await decide(client=jev, observation=_sugar_page(), goal=goal, history=[])  # type: ignore[arg-type]
+    if jev.checks or decision.check is not None:
+        raise CheckTestFailure("check ran on a confident decision")
+    # Gap 2: an unsure pick (the favourites detour at 0.45) is checked and logged; the
+    # better candidate is named, and the action stays the policy's own pick.
+    jev = _SplitJev(0.9, [0.30, 0.25, 0.45], [0.10, 0.85, 0.90])  # pick first: fav, open, add
+    decision = await decide(client=jev, observation=_sugar_page(), goal=goal, history=[])  # type: ignore[arg-type]
+    if jev.checks != 1 or decision.check != "cleared" or decision.check_switch != _SUGAR[1]:
+        raise CheckTestFailure(f"check not logged: {decision.check} {decision.check_switch}")
+    if decision.action is None or decision.action.label != _SUGAR[2]:
+        raise CheckTestFailure("log-only check changed the action")
+    if decision.usage.get("input_tokens") != 1050:
+        raise CheckTestFailure(f"check tokens not counted: {decision.usage}")
+    # Gap 3: escalate on the second failure in a row, or at once for DONE/BLOCKED.
+    failed = replace(decision, check="failed")
+    if should_escalate(failed, previous_check_failed=False) or not should_escalate(failed, True):
+        raise CheckTestFailure("streak rule wrong")
+    if not should_escalate(replace(failed, operation="DONE"), previous_check_failed=False):
+        raise CheckTestFailure("failed DONE did not escalate at once")
+    if should_escalate(decision, previous_check_failed=True):
+        raise CheckTestFailure("cleared check escalated")
+
+
+async def _check_e2e_live() -> None:
+    import os
+
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        print("skip: live check tests need TYPESAFE_API_KEY")
+        return
+    client = JevClient()
+    # End to end 1: a Walmart step unsure between opening and adding the same sugar clears.
+    sugar = await check_step(
+        client=client, goal="Search 'granulated sugar' and add one bag to the cart. Do not place the order.",
+        page={"url": "https://www.walmart.ca/en/search?q=granulated+sugar", "title": "granulated sugar"},
+        recent_actions=[{"label": "Search", "page_changed": True}], candidates=list(_SUGAR))
+    print(f"live: sugar -> {sugar.verdict if sugar else None} best={sugar.best_p if sugar else 0:.2f} "
+          f"switch={sugar.switch if sugar else None!r}")
+    if sugar is None or sugar.verdict != "cleared":
+        raise CheckTestFailure("harmless split did not clear")
+    # End to end 2: the Chipotle scroll loop fails the check.
+    loop = await check_step(
+        client=client, goal=_GOAL,
+        page={"url": "https://www.doordash.com/store/chipotle-waterloo-36154775/81102878/", "title": "Chipotle"},
+        recent_actions=[{"label": "Item Search", "page_changed": True}, {"label": "Press Enter", "page_changed": True},
+                        {"label": "Scroll down", "page_changed": True}, {"label": "Scroll up", "page_changed": True},
+                        {"label": "Scroll down", "page_changed": True}],
+        candidates=["SCROLL_DOWN: Reveal content below the viewport.",
+                    "CLICK: Click an element, button, menu option, or link.",
+                    "BLOCKED: No supported operation can advance the goal."])
+    print(f"live: chipotle loop -> {loop.verdict if loop else None} best={loop.best_p if loop else 0:.2f}")
+    if loop is None or loop.verdict != "failed":
+        raise CheckTestFailure("scroll loop passed the check")
+
+
 if __name__ == "__main__":
     import asyncio
 
     asyncio.run(_unit_tests())
+    asyncio.run(_check_unit_tests())
     asyncio.run(_e2e_live())
-    print("jev_policy.py inline dialog tests passed")
+    asyncio.run(_check_e2e_live())
+    print("jev_policy.py inline dialog and step-check tests passed")

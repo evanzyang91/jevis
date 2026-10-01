@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 
 from agent.executor import Action, Executor, Occluded, Outcome, StalePage
 from agent.perception import Observation, detect_captcha, observe
-from agent.policy import Decision, NoFieldValue, decide, field_value
+from agent.policy import Decision, NoFieldValue, decide, field_value, should_escalate
 from agent.providers import JevClient, TextAdapter
 from agent.transport import (
     ActionEvent,
@@ -70,6 +70,9 @@ class RunState:
     # Last cursor position emitted to the UI. The overlay draws from here to
     # the next click's centre so the animation matches the real motion.
     cursor: tuple[float, float] = (640.0, 400.0)
+    # Whether the previous decision's step check failed. Escalation waits for a
+    # second failure in a row, so one-off doubts do not call the LLM.
+    check_failed: bool = False
 
 
 @dataclass(slots=True)
@@ -247,6 +250,9 @@ class Supervisor:
                 history=history_for_policy,
                 banned=banned,
             )
+        # Log-only for now: record where an LLM would be asked to reinstruct.
+        escalate = should_escalate(decision, state.check_failed)
+        state.check_failed = decision.check == "failed"
         state.budget.spent(
             decision.model,
             tokens_in=int(decision.usage.get("input_tokens", 0)),
@@ -267,6 +273,11 @@ class Supervisor:
             offered={op: list(labels) for op, labels in decision.offered.items()},
             dialog=decision.dialog or "",
             dialog_p=decision.dialog_p,
+            signal=decision.signal,
+            check=decision.check or "",
+            check_p=decision.check_p,
+            check_switch=decision.check_switch or "",
+            escalate=escalate,
         ))
         return decision
 

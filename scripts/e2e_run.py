@@ -112,7 +112,14 @@ async def _drive(goal: str, url: str, timeout_s: float, captcha_grace_s: float) 
             elif isinstance(event, DecisionEvent):
                 seen["decisions"].append({"op": event.operation, "choice": event.choice,
                                           "confidence": round(event.confidence, 3),
-                                          "ms": event.latency_ms, "model": event.model})
+                                          "ms": event.latency_ms, "model": event.model,
+                                          "signal": round(event.signal, 3), "check": event.check,
+                                          "check_p": round(event.check_p, 3), "switch": event.check_switch,
+                                          "escalate": event.escalate})
+                if event.check:
+                    print(f"        check {event.check} (best {event.check_p:.2f}, signal {event.signal:.2f})"
+                          + (f" would switch to {event.check_switch!r}" if event.check_switch else "")
+                          + ("  -> ESCALATE" if event.escalate else ""), flush=True)
             elif isinstance(event, ActionEvent):
                 seen["actions"].append({"kind": event.action_kind, "label": event.target_label,
                                         "text": event.text})
@@ -174,13 +181,16 @@ def run_case(goal: str, url: str = "") -> int:
         "decisions": len(seen["decisions"]), "jev_ms_avg": round(sum(ms) / len(ms)) if ms else None,
         "added_to_cart": sum(bool(ADDED_TO_CART.search(a["label"] or "")) for a in seen["actions"]),
         "captchas": seen["captchas"], "wall_s": round(time.monotonic() - started),
+        "checks": sum(bool(d["check"]) for d in seen["decisions"]),
+        "escalations": sum(d["escalate"] for d in seen["decisions"]),
         "final_url": seen["urls"][-1] if seen["urls"] else None, **seen,
     }
     out = Path(seen["log"]).with_suffix(".e2e.json") if seen["log"] else Path("e2e_run.json")
     out.write_text(json.dumps(summary, indent=1))
     print(f"\n{'PASS' if not failures else 'FAIL'}: status={seen['status']} ({seen['reason']})")
     print(f"steps={summary['steps']} add_to_cart={summary['added_to_cart']} "
-          f"jev_ms_avg={summary['jev_ms_avg']} wall={summary['wall_s']}s captchas={seen['captchas']}")
+          f"jev_ms_avg={summary['jev_ms_avg']} wall={summary['wall_s']}s captchas={seen['captchas']} "
+          f"checks={summary['checks']} escalations={summary['escalations']}")
     for failure in failures:
         print(f"  {type(failure).__name__}: {failure}")
     print(f"summary: {out}\nevents:  {seen['log']}")

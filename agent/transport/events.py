@@ -115,6 +115,16 @@ class DecisionEvent(_EventBase):
     # Empty when no modal was open or the diagnosis was not confident.
     dialog: str = ""
     dialog_p: float = 0.0
+    # Confidence with one item's routes counted together ("X" + "Add to cart - X").
+    signal: float = 1.0
+    # The step check when the policy was unsure: "cleared", "failed", or empty
+    # when it did not run. `check_switch` is a better-scoring candidate, if any.
+    check: str = ""
+    check_p: float = 0.0
+    check_switch: str = ""
+    # True where an LLM would be asked to reinstruct (two failed checks in a row,
+    # or a failed DONE or BLOCKED). Log-only: the action is unchanged.
+    escalate: bool = False
 
 
 # ---- Execution --------------------------------------------------------------

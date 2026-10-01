@@ -113,5 +113,20 @@ DIALOG_KINDS = {
     ),
 }
 
+# The step check: asked when the policy is unsure, on its top three candidates.
+# Wording and context chosen by an offline sweep of 21 prompts over 84 labelled
+# steps (2026-10-01): "reasonable next step" stayed flat as the check ran more
+# often, and the rules are what make it reject a sign-in or favourites detour.
+STEP_CHECK = {
+    "question": "Is choosing {candidate} now a reasonable next step toward `goal`?",
+    "rules": (
+        "`recent_actions` is the record of progress. Judge the effect of the action, not its words. "
+        "Opening an item's page and adding that item to the cart both advance adding that item. "
+        "A control that leaves the task does not advance it: sign-in, a favourites or wish list, "
+        "other stores, or a control of the page behind an open dialog. Repeating an action whose "
+        "page_changed was false does not advance it."
+    ),
+}
+
 CLASSIFY = """Choose the category that best matches the user goal.
 Read the goal and the site address. Choose the closest fit."""
