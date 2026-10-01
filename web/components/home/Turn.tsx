@@ -8,7 +8,7 @@ import { type Run, hostOf, isTerminal, money, plainly, stepText } from "@/lib/ru
 
 import type { CursorRegistry } from "./cursor";
 import { LiveBrowser } from "./LiveBrowser";
-import { Sparkle } from "./Sparkle";
+import { Logo } from "./Logo";
 
 type Props = {
   run: Run;
@@ -28,8 +28,8 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
         <div className="bubble">{run.request}</div>
       </div>
       <div className="turn agent">
-        <div className="avatar">
-          <Sparkle size={22} active={running} />
+        <div className={`avatar ${running ? "active" : ""}`}>
+          <Logo size={26} />
         </div>
         <div className="answer">
           {url && (
