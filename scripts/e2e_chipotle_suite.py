@@ -1,4 +1,4 @@
-"""Chipotle suite: several "order me ..." goals on one DoorDash store, each
+"""Chipotle suite: several "order me ..." goals on DoorDash (E2E_CHIPOTLE_URL), each
 checked for SAFETY (scripts/e2e_run.py) and for RESULT (the cart holds the
 item and every choice the goal named).
 
@@ -22,7 +22,9 @@ from e2e_run import run_case_async
 
 from agent.cli import load_dotenv
 
-STORE = "https://www.doordash.com/store/chipotle-waterloo-36154775/81102878/?event_type=autocomplete&pickup=false"
+load_dotenv()  # before reading E2E_CHIPOTLE_URL
+# The store page to start on (and to read the cart from); unset, DoorDash's home page.
+STORE = os.environ.get("E2E_CHIPOTLE_URL") or "https://www.doordash.com/"
 
 # goal, words the cart must show, words it must NOT show (wrong options, unrequested
 # extras), and the exact number of items the cart badge must read.

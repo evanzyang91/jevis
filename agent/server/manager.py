@@ -67,7 +67,7 @@ class RunManager:
                 await self._stop_superseded(older)
         run_id = uuid4()
         # Empty start_url signals "the planner picks it". Localisation to a
-        # Canadian storefront happens inside _drive so both suggested and
+        # the user's regional storefront (AGENT_REGION) happens inside _drive so both suggested and
         # user-supplied US retailer URLs get the same treatment.
         run = Run(run_id=run_id, goal=goal, start_url=url.strip())
         self._runs[run_id] = run
@@ -148,7 +148,7 @@ class RunManager:
 
             # If the user did not supply a URL, ask the text model to pick one
             # from the goal ("buy cake ingredients from Walmart" → walmart.com).
-            # Then localise US retailers to their Canadian storefront so the
+            # Then localise global retailers to the regional storefront (AGENT_REGION) so the
             # session runs against the correct catalog and pricing.
             if not run.start_url:
                 try:

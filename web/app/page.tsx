@@ -19,20 +19,22 @@ import { subscribeEvents, subscribeFrames } from "@/lib/ws";
 
 
 // Suggestion cards: the task, the site it starts on, and a line icon for its kind of work.
+// Global addresses only: the server maps them to the regional storefront (AGENT_REGION),
+// and on DoorDash the agent finds the nearest store from the address the site shows.
 const EXAMPLES: { text: string; url: string; icon: string }[] = [
   {
     text: "Add the ingredients for a chocolate cake to my cart",
-    url: "https://www.walmart.ca/en",
+    url: "https://www.walmart.com/",
     icon: "M3 4h2l2.4 11h10.2L20 7H6.2M9 20h.01M17 20h.01",
   },
   {
     text: "Order me a barbacoa bowl from Chipotle",
-    url: "https://www.doordash.com/store/chipotle-waterloo-36154775/81102878/",
+    url: "https://www.doordash.com/",
     icon: "M4 11h16a8 8 0 0 1-16 0ZM8 7c0-1 1-2 2-2M12 7c0-1.5 1-3 2.5-3",
   },
   {
     text: "Find a highly rated wireless mouse under $50",
-    url: "https://www.amazon.ca/",
+    url: "https://www.amazon.com/",
     icon: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14ZM20 20l-4-4",
   },
   {

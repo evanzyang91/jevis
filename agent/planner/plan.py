@@ -9,6 +9,7 @@ before the plan advances.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -118,27 +119,95 @@ def _fallback_url(goal: str) -> str:
     return "https://www.google.com/"
 
 
-# Retailers with a distinct Canadian storefront. Redirect on both the raw and
-# `www.`-prefixed forms. Only sites with a real .ca equivalent belong here —
-# adding a bogus one would send the run to a 404.
-_CANADIAN_HOSTS: dict[str, str] = {
-    "amazon.com": "www.amazon.ca",
-    "walmart.com": "www.walmart.ca",
-    "bestbuy.com": "www.bestbuy.ca",
-    "costco.com": "www.costco.ca",
-    "homedepot.com": "www.homedepot.ca",
-    "staples.com": "www.staples.ca",
-    "newegg.com": "www.newegg.ca",
-    "ebay.com": "www.ebay.ca",
-    "indeed.com": "ca.indeed.com",
+# Regional storefronts, by AGENT_REGION (an ISO country code). Unset means no
+# region: URLs pass through unchanged. Redirect on both the raw and
+# `www.`-prefixed forms. Only sites with a real regional equivalent belong
+# here — adding a bogus one would send the run to a 404.
+_REGIONAL_HOSTS: dict[str, dict[str, str]] = {
+    "CA": {
+        "amazon.com": "www.amazon.ca",
+        "walmart.com": "www.walmart.ca",
+        "bestbuy.com": "www.bestbuy.ca",
+        "costco.com": "www.costco.ca",
+        "homedepot.com": "www.homedepot.ca",
+        "staples.com": "www.staples.ca",
+        "newegg.com": "www.newegg.ca",
+        "ebay.com": "www.ebay.ca",
+        "indeed.com": "ca.indeed.com",
+    },
 }
 
 
-def localise(url: str) -> str:
-    """Rewrite a US retailer URL to its Canadian storefront when one exists."""
+def localise(url: str, region: str | None = None) -> str:
+    """Rewrite a global retailer URL to its storefront in `region` (default:
+    AGENT_REGION) when one exists; with no region, return the URL unchanged."""
+    if region is None:
+        region = os.environ.get("AGENT_REGION", "")
+    hosts = _REGIONAL_HOSTS.get(region.strip().upper(), {})
     parts = urlparse(url)
     host = (parts.hostname or "").lower().removeprefix("www.")
-    canadian = _CANADIAN_HOSTS.get(host)
-    if not canadian:
+    regional = hosts.get(host)
+    if not regional:
         return url
-    return parts._replace(netloc=canadian).geturl()
+    return parts._replace(netloc=regional).geturl()
+
+
+# ---- Inline tests: `uv run python -m agent.planner.plan` ------------------------------
+# Live: they call the configured text model (TEXT_MODEL in .env), a fraction of a cent.
+
+
+class PlannerTestFailure(AssertionError):
+    """An inline planner test saw the wrong result."""
+
+
+async def _e2e_site_routing(adapter: TextAdapter) -> None:
+    """Restaurant food goes to DoorDash, never the restaurant's own site; other
+    kinds of goal keep their usual sites. Checked under region CA."""
+    cases = {
+        "order me a barbacoa bowl from chipotle": "doordash.com",
+        "get me a large iced coffee from starbucks": "doordash.com",
+        "can you get me ingredients for a cake": "walmart.ca",
+        "buy a wireless mouse from amazon": "amazon.ca",
+        "open the wikipedia article on gödel's incompleteness theorems": "wikipedia.org",
+    }
+    for goal, host in cases.items():
+        url = localise(await suggest_url(adapter=adapter, goal=goal), region="CA")
+        if host not in (urlparse(url).hostname or ""):
+            raise PlannerTestFailure(f"{goal!r} started on {url}, wanted {host}")
+        print(f"  {goal[:50]:50} -> {url}")
+
+
+async def _e2e_delivery_plan(adapter: TextAdapter) -> None:
+    """On DoorDash's home page the plan finds the restaurant first and keeps the
+    shown address; it never asks the agent to type one."""
+    plan = await build_plan(adapter=adapter, goal="order me a barbacoa bowl from chipotle",
+                            url="https://www.doordash.com")
+    goal = plan.refined_goal.lower()
+    first = plan.subgoals[0].text.lower()
+    if "chipotle" not in first:
+        raise PlannerTestFailure(f"the plan does not open the restaurant first: {first!r}")
+    if any(word in goal for word in ("type the address", "enter an address", "enter the address", "new address")):
+        raise PlannerTestFailure(f"the plan asks for an address: {plan.refined_goal!r}")
+    print(f"  plan: {plan.refined_goal}")
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    from agent.cli import load_dotenv
+    from agent.providers import adapter_for
+    from agent.providers.registry import get
+
+    load_dotenv()
+    model = os.environ.get("TEXT_MODEL", "")
+    if not model or not os.environ.get("OPENAI_API_KEY"):
+        print("skip: live planner tests need TEXT_MODEL and OPENAI_API_KEY")
+    else:
+        text = adapter_for(model, get(model).provider)
+
+        async def _all() -> None:  # one event loop: the adapter's client is bound to it
+            await _e2e_site_routing(text)
+            await _e2e_delivery_plan(text)
+
+        asyncio.run(_all())
+        print("plan.py inline tests passed")

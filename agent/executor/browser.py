@@ -200,7 +200,9 @@ class PlaywrightExecutor:
         context_common = dict(
             viewport={"width": self._viewport[0], "height": self._viewport[1]},
             locale="en-US",
-            timezone_id="America/Toronto",
+            # The machine's own time zone unless AGENT_TIMEZONE names one (an IANA
+            # name such as "America/Toronto"); never a fixed place.
+            timezone_id=os.environ.get("AGENT_TIMEZONE", "").strip() or None,
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"

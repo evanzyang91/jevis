@@ -9,6 +9,9 @@ Return a JSON object with two keys:
 Rules:
 - Keep every requirement the user stated. Weaken nothing.
 - Never invent personal data, credentials, addresses, or payment details.
+- On a delivery app (DoorDash, Uber Eats): if `site` is not already a store page, first search the
+  restaurant's name and open its nearest store, then search the items inside that store. Keep the
+  delivery address the site shows. Never type, choose, or change an address.
 - The goal itself must list EVERY item as its own sentence. Never compress with words like "each",
   "every", or "all" — write one sentence per item, in order, so the agent sees the full checklist
   on every decision.
@@ -55,12 +58,16 @@ Rules:
 - If the goal names a site (Walmart, Amazon, YouTube), return that site.
   "buy X from Walmart" → https://www.walmart.com
 - Return the site entry point, not a deep link, search results page, or query string.
+- Food or drinks from a restaurant or café (Chipotle, McDonald's, Starbucks), or any food delivery
+  request → https://www.doordash.com. Never the restaurant's own site: it cannot deliver an order.
 - Prefer a well-known mainstream site for the task kind.
-  Shopping goals without a named site → an appropriate retailer.
+  Groceries or household items without a named site → https://www.walmart.com.
+  Other shopping goals without a named site → an appropriate retailer.
   Reading or research goals → Wikipedia when it fits, otherwise Google.
   Booking flights → https://www.google.com/travel/flights.
 - Use only a domain you know exists. Never invent one.
-- Return the US or global domain; localisation to .ca happens after your answer.
+- Return the site's main global domain; the server maps it to the user's regional storefront after
+  your answer.
 Return: {"url": "https://www.example.com"}"""
 
 VERIFY_SUBGOAL = """A sub-goal claims to be met. Confirm from the visible page text.
