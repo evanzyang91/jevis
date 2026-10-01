@@ -233,12 +233,13 @@ class PlaywrightExecutor:
                         tb: TracebackType | None) -> None:
         if self._screencast_task is not None:
             self._screencast_task.cancel()
-        # Attached mode: never close the user's Chrome. Close the tabs this run
-        # opened (its own, and any popups from it), so runs do not pile tabs up
-        # in the user's browser. AGENT_KEEP_TAB=1 leaves them open to inspect.
+        # Attached mode: never close the user's Chrome. The run's tab stays open,
+        # so the user sees where the run ended (the cart, for a demo).
+        # AGENT_CLOSE_TAB=1 closes the tabs this run opened (its own, and any
+        # popups from it), so test suites do not pile tabs up in the browser.
         if self._attached:
-            keep = os.environ.get("AGENT_KEEP_TAB", "").strip().lower() in {"1", "true", "yes"}
-            if not keep and self._owns_page and self._context is not None:
+            close = os.environ.get("AGENT_CLOSE_TAB", "").strip().lower() in {"1", "true", "yes"}
+            if close and self._owns_page and self._context is not None:
                 opened = [self._page] if self._relay is None else list(self._context.pages)
                 for page in opened:  # through the relay, every page listed is one this run opened
                     try:

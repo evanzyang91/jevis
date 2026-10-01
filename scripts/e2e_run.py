@@ -178,6 +178,7 @@ async def run_case_async(goal: str, url: str = "") -> int:
     """`run_case` inside a running event loop, so a suite's cases share one
     Chrome debugging connection (one "Allow" prompt for the whole suite)."""
     load_dotenv()
+    os.environ.setdefault("AGENT_CLOSE_TAB", "1")  # a suite opens a tab per run: close each one
     timeout_s = float(os.environ.get("E2E_TIMEOUT_S", "900"))
     grace_s = float(os.environ.get("E2E_CAPTCHA_GRACE_S", "90"))
     started = time.monotonic()

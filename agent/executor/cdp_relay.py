@@ -203,6 +203,9 @@ class CdpTabRelay:
         self._client_methods: dict[int, str] = {}
         self._allowed: set[str] = set()
         self._sessions: set[str] = set()
+        # Sessions on the browser target itself (Target.attachToBrowserTarget).
+        # Playwright opens its CDP sessions (screencast) through one of these.
+        self._browser_sessions: set[str] = set()
         self._auto_attach = False
         self._marker: str | None = None
         self._marked: asyncio.Future[str] | None = None
@@ -292,6 +295,10 @@ class CdpTabRelay:
         result = message.get("result")
         if method == "Target.getTargets" and result:
             result["targetInfos"] = visible_targets(result["targetInfos"], self._allowed)
+        if method == "Target.attachToBrowserTarget" and result:
+            # Known before the client hears of it, so the events that follow reach it.
+            self._sessions.add(result["sessionId"])
+            self._browser_sessions.add(result["sessionId"])
         await self._to_client(message)
         if method == "Target.createTarget" and result:  # a tab Playwright opened itself
             self._allowed.add(result["targetId"])
@@ -368,6 +375,15 @@ class CdpTabRelay:
         if session is None and method == "Target.closeTarget" and \
                 message.get("params", {}).get("targetId") not in self._allowed:
             await self._to_client({"id": call_id, "error": {"code": -32000, "message": "not a relay tab"}})
+            return
+        if (session is None or session in self._browser_sessions) and method == "Target.attachToTarget" and \
+                message.get("params", {}).get("targetId") not in self._allowed:
+            await self._to_client({"id": call_id, "error": {"code": -32000, "message": "not a relay tab"}})
+            return
+        if session in self._browser_sessions and method != "Target.attachToTarget":
+            # A browser session reaches every tab: it may only attach to the relay's own.
+            await self._to_client({"id": call_id, "error": {"code": -32000,
+                                                            "message": "relay allows only attaching to its tab"}})
             return
         if call_id is not None:
             self._client_methods[call_id] = method
@@ -484,6 +500,18 @@ async def _test_relay_shows_one_tab() -> None:
                 await pages[0].goto("data:text/html,<title>agent tab</title>")
                 if await pages[0].title() != "agent tab":
                     raise RelayTestFailure("could not drive the relay tab")
+                # The live view: Playwright opens this session through a browser session.
+                frames: list[dict] = []
+                cdp = await browser.contexts[0].new_cdp_session(pages[0])
+                cdp.on("Page.screencastFrame", lambda event: frames.append(event))
+                await cdp.send("Page.startScreencast", {"format": "jpeg"})
+                await pages[0].evaluate("document.body.style.background = 'red'")
+                for _ in range(30):
+                    if frames:
+                        break
+                    await asyncio.sleep(0.1)
+                if not frames:
+                    raise RelayTestFailure("no screencast frames reached the client")
                 await browser.close()
             await relay.close()
             if process.returncode is not None:
@@ -508,11 +536,11 @@ async def _test_executor_through_relay() -> None:
             {"profile": {"info_cache": {"Default": {"name": "Relay Test"}}}}))
         process = await _launch_throwaway_chrome(tmp, headless=False)
         saved = {k: os.environ.get(k) for k in ("AGENT_CDP_URL", "AGENT_CHROME_PROFILE", "AGENT_CHROME_USER_DATA_DIR",
-                                                "AGENT_CHROME_BINARY")}
+                                                "AGENT_CHROME_BINARY", "AGENT_CLOSE_TAB")}
         try:
             name = "relay test"  # matched case-insensitively
             os.environ.update(AGENT_CDP_URL="auto", AGENT_CHROME_PROFILE=name, AGENT_CHROME_USER_DATA_DIR=tmp,
-                              AGENT_CHROME_BINARY=await _throwaway_executable())
+                              AGENT_CHROME_BINARY=await _throwaway_executable(), AGENT_CLOSE_TAB="1")
             async with PlaywrightExecutor() as executor:
                 await executor.page.goto("data:text/html,<title>executor tab</title>")
                 if await executor.page.title() != "executor tab":

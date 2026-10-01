@@ -47,6 +47,7 @@ def _relay_settings() -> None:
     """Load .env and default to the relay on the user's Chrome."""
     load_dotenv()
     os.environ["AGENT_CDP_URL"] = os.environ.get("E2E_CDP_URL", "auto")
+    os.environ.setdefault("AGENT_CLOSE_TAB", "1")  # the cart checks open tabs too
     if not os.environ.get("AGENT_CHROME_PROFILE"):
         raise SystemExit("Set AGENT_CHROME_PROFILE to the Chrome profile to run in (its display name).")
 
