@@ -8,6 +8,7 @@ import { type Run, hostOf, isTerminal, money, plainly, stepText } from "@/lib/ru
 
 import type { CursorRegistry } from "./cursor";
 import { LiveBrowser } from "./LiveBrowser";
+import { Sparkle } from "./Sparkle";
 
 type Props = {
   run: Run;
@@ -27,53 +28,66 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
         <div className="bubble">{run.request}</div>
       </div>
       <div className="turn agent">
-        {url && (
-          <div className="site">
-            Working on <code>{hostOf(url)}</code>
-          </div>
-        )}
-        <ol className="acts">
-          {run.steps.map((step) => (
-            <li key={step.action.seq} className={step.outcome?.page_changed === false ? "failed" : ""}>
-              {stepText(step)}
-            </li>
-          ))}
+        <div className="avatar">
+          <Sparkle size={22} active={running} />
+        </div>
+        <div className="answer">
+          {url && (
+            <div className="site">
+              Working on <code>{hostOf(url)}</code>
+            </div>
+          )}
           {running && (
-            <li className="current">
+            <p className="now">
               {run.status === "starting"
                 ? "Planning and opening the browser"
                 : run.status === "paused"
                   ? "Waiting for you"
                   : plainly(run.decision, run.observation)}
-            </li>
+            </p>
           )}
-        </ol>
-        {run.captcha && run.status === "paused" && (
-          <div className="notice" role="alert">
-            <strong>The site asked to check that you are human.</strong> {run.captcha.reason} Solve it in the browser
-            window, then continue.
-            <div>
-              <button type="button" className="ghost" onClick={onResumeCaptcha}>
-                Continue
-              </button>
+          {run.steps.length > 0 && (
+            // Open while the agent works; folded to one line once it is done.
+            <details className="steps" open={running ? true : undefined}>
+              <summary>
+                {running ? "Show steps" : "Steps"} <span>{run.steps.length}</span>
+              </summary>
+              <ol className="acts">
+                {run.steps.map((step) => (
+                  <li key={step.action.seq} className={step.outcome?.page_changed === false ? "failed" : ""}>
+                    {stepText(step)}
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
+          {run.captcha && run.status === "paused" && (
+            <div className="notice" role="alert">
+              <strong>The site asked to check that you are human.</strong> {run.captcha.reason} Solve it in the browser
+              window, then continue.
+              <div>
+                <button type="button" className="ghost" onClick={onResumeCaptcha}>
+                  Continue
+                </button>
+              </div>
             </div>
-          </div>
-        )}
-        {showBrowser && (
-          <div className="turn-browser">
-            <LiveBrowser frame={frame} url={url} live={running} cursor={cursor} />
-          </div>
-        )}
-        {!running && (
-          <p className={`verdict ${run.status === "done" ? "ok" : "bad"}`}>
-            {run.status === "done"
-              ? "Done. The browser window shows the result."
-              : run.status === "error"
-                ? `Something went wrong: ${run.reason || "the run failed."}`
-                : "I could not finish this one. The browser window shows where I stopped."}
-          </p>
-        )}
-        {!running && <Results run={run} />}
+          )}
+          {showBrowser && (
+            <div className="turn-browser">
+              <LiveBrowser frame={frame} url={url} live={running} cursor={cursor} />
+            </div>
+          )}
+          {!running && (
+            <p className={`verdict ${run.status === "done" ? "ok" : "bad"}`}>
+              {run.status === "done"
+                ? "Done. The browser window shows the result."
+                : run.status === "error"
+                  ? `Something went wrong: ${run.reason || "the run failed."}`
+                  : "I could not finish this one. The browser window shows where I stopped."}
+            </p>
+          )}
+          {!running && <Results run={run} />}
+        </div>
       </div>
     </>
   );

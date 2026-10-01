@@ -8,19 +8,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { DevDrawer } from "@/components/home/DevDrawer";
+import { Logo } from "@/components/home/Logo";
 import { Turn } from "@/components/home/Turn";
 import { type CursorEvent, isCursorEvent } from "@/components/home/cursor";
 import type { FrameEvent } from "@/lib/events";
 import { type Run, isTerminal, newRun, reduce, seconds } from "@/lib/run";
+import { useFollowBottom } from "@/lib/follow";
 import { useVoice } from "@/lib/voice";
 import { subscribeEvents, subscribeFrames } from "@/lib/ws";
 
 import "./home.css";
 
-const EXAMPLES = [
-  "Add the ingredients for a chocolate cake to my cart",
-  "Find a highly rated wireless mouse under $50",
-  "Open the Wikipedia article on Gödel's incompleteness theorems",
+// Suggestion cards: the task, and a line icon for its kind of work.
+const EXAMPLES: { text: string; icon: string }[] = [
+  { text: "Add the ingredients for a chocolate cake to my cart", icon: "M3 4h2l2.4 11h10.2L20 7H6.2M9 20h.01M17 20h.01" },
+  { text: "Order me a barbacoa bowl from Chipotle", icon: "M4 11h16a8 8 0 0 1-16 0ZM8 7c0-1 1-2 2-2M12 7c0-1.5 1-3 2.5-3" },
+  { text: "Find a highly rated wireless mouse under $50", icon: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14ZM20 20l-4-4" },
+  { text: "Open the Wikipedia article on Gödel's incompleteness theorems", icon: "M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3V4ZM17 20h2V7" },
 ];
 
 const STATUS_LINE: Record<Run["status"], string> = {
@@ -59,6 +63,7 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [dev, setDev] = useState(false);
   const [theme, setTheme] = useState<"" | "light" | "dark">("");
+  const [systemDark, setSystemDark] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState("");
   const [, tick] = useState(0);
@@ -74,6 +79,11 @@ export default function Home() {
     setDev(recall(DEV_KEY) === "1");
     const saved = recall(THEME_KEY);
     setTheme(saved === "light" || saved === "dark" ? saved : "");
+    // The theme button shows the mode it switches to, so it tracks the system's mode too.
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    setSystemDark(query.matches);
+    const follow = (event: MediaQueryListEvent) => setSystemDark(event.matches);
+    query.addEventListener("change", follow);
     fetch("/api/models")
       .then((r) => r.json())
       .then((data: { models: { id: string; modalities: string[] }[] }) => {
@@ -82,6 +92,7 @@ export default function Home() {
         setModels(data.models.filter((m) => m.modalities.includes("text") && !m.id.startsWith("jev")).map((m) => m.id));
       })
       .catch(() => setError("Cannot reach the agent server. Start it with `uv run agent`."));
+    return () => query.removeEventListener("change", follow);
   }, []);
 
   const cursor = useCallback((handler: (event: CursorEvent) => void) => {
@@ -113,10 +124,7 @@ export default function Home() {
     return () => window.clearInterval(id);
   }, [running]);
 
-  useEffect(() => {
-    const box = thread.current;
-    if (box) box.scrollTop = box.scrollHeight;
-  }, [runs]);
+  const followBottom = useFollowBottom(thread);
 
   const grow = () => {
     const box = goalBox.current;
@@ -143,6 +151,7 @@ export default function Home() {
       if (!response.ok) throw new Error(data.detail || data.error || "The agent server refused the task.");
       setFrame(null);
       setRuns((prior) => [...prior, newRun(data.run_id, request)]);
+      followBottom();
       setGoal("");
       remember("agent.lastRunId", data.run_id); // the full inspector at /dev opens this run
     } catch (err) {
@@ -172,10 +181,9 @@ export default function Home() {
   };
 
   // Follow the system unless the reader says otherwise, and remember that choice.
+  const dark = (theme || (systemDark ? "dark" : "light")) === "dark";
   const toggleTheme = () => {
-    const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    const now = theme || (dark ? "dark" : "light");
-    const next = now === "dark" ? "light" : "dark";
+    const next = dark ? "light" : "dark";
     setTheme(next);
     remember(THEME_KEY, next);
   };
@@ -189,15 +197,30 @@ export default function Home() {
       data-theme={theme || undefined}
     >
       <header>
-        <div className="brand-space" />
+        <div className="brand">
+          <Logo size={26} />
+          <span>Jevis</span>
+        </div>
         <div className="header-right">
           {current && <span className="elapsed">{seconds(elapsed)}</span>}
           {current && dev && <span className="elapsed model">model {seconds(modelMs)}</span>}
-          <button type="button" className="icon small" aria-label="Switch theme" title="Switch theme" onClick={toggleTheme}>
-            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-              <circle cx="12" cy="12" r="4.2" />
-              <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" />
-            </svg>
+          <button
+            type="button"
+            className="icon small"
+            aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}
+            title={dark ? "Switch to light theme" : "Switch to dark theme"}
+            onClick={toggleTheme}
+          >
+            {dark ? (
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <circle cx="12" cy="12" r="4.2" />
+                <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7Z" />
+              </svg>
+            )}
           </button>
           <label className="mode">
             <input type="checkbox" checked={dev} onChange={(e) => toggleDev(e.target.checked)} /> Developer
@@ -209,20 +232,25 @@ export default function Home() {
         <div className="thread" ref={thread}>
           {runs.length === 0 ? (
             <div className="intro">
-              <h1>What should I do on the web?</h1>
-              <p className="sub">Describe a task in your own words. I&apos;ll open a browser and do it while you watch.</p>
+              <h1>
+                <span className="greeting">Hello there</span>
+                <span className="question">What should we do today?</span>
+              </h1>
               <div className="examples">
                 {EXAMPLES.map((example) => (
                   <button
-                    key={example}
+                    key={example.text}
                     type="button"
                     className="example"
                     onClick={() => {
-                      setGoal(example);
+                      setGoal(example.text);
                       goalBox.current?.focus();
                     }}
                   >
-                    {example}
+                    <span>{example.text}</span>
+                    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                      <path d={example.icon} />
+                    </svg>
                   </button>
                 ))}
               </div>
