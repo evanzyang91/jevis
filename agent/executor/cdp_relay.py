@@ -214,8 +214,13 @@ class CdpTabRelay:
     async def start(self) -> str:
         """Open the tab and the local socket. Returns the URL for Playwright."""
         self._link = await _Link.get(self._upstream_url)
-        if self._link.owner is not None:
-            raise RelayError("Another relay is using this Chrome connection; runs share it one at a time.")
+        previous = self._link.owner
+        if previous is not None:
+            # Runs share one connection one at a time, and the newest run wins:
+            # an older run still holding it (its page was reloaded, or it was
+            # never stopped) is cut off, and its client sees the browser close.
+            log.warning("cdp relay: a newer run takes over the Chrome connection")
+            await previous.close()
         self._link.owner = self
         try:
             if self._profile:
@@ -240,6 +245,11 @@ class CdpTabRelay:
         so the next relay starts clean."""
         if self._server is not None:
             self._server.close()
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:  # noqa: BLE001 — already closing
+                pass
         if self._link is not None and self._link.owner is self:
             for session in list(self._sessions):
                 try:
@@ -597,8 +607,45 @@ async def _test_relays_share_one_connection() -> None:
             await process.wait()
 
 
+async def _test_newer_relay_takes_over() -> None:
+    """End to end: a relay that starts while an older one still holds the
+    connection takes it over; the older client is cut off, the newer one drives."""
+    import tempfile
+
+    from playwright.async_api import async_playwright
+
+    with tempfile.TemporaryDirectory() as tmp:
+        process = await _launch_throwaway_chrome(tmp)
+        try:
+            upstream = devtools_ws_url(Path(tmp))
+            async with async_playwright() as pw:
+                older = CdpTabRelay(upstream, user_data_dir=Path(tmp))
+                old_browser = await pw.chromium.connect_over_cdp(await older.start(), timeout=20_000)
+                newer = CdpTabRelay(upstream, user_data_dir=Path(tmp))
+                new_browser = await pw.chromium.connect_over_cdp(await newer.start(), timeout=20_000)
+                for _ in range(50):
+                    if not old_browser.is_connected():
+                        break
+                    await asyncio.sleep(0.1)
+                if old_browser.is_connected():
+                    raise RelayTestFailure("the older run kept the connection")
+                page = [p for c in new_browser.contexts for p in c.pages][0]
+                await page.goto("data:text/html,<title>newer run</title>")
+                if await page.title() != "newer run":
+                    raise RelayTestFailure("the newer run could not drive its tab")
+                await new_browser.close()
+                await newer.close()
+                await older.close()  # late exit of the older run must not take the link back
+                if newer._link is not None and newer._link.owner is not None:
+                    raise RelayTestFailure("the link was not released")
+        finally:
+            process.kill()
+            await process.wait()
+
+
 if __name__ == "__main__":
     _test_config_resolution()
+    asyncio.run(_test_newer_relay_takes_over())
     asyncio.run(_test_relays_share_one_connection())
     asyncio.run(_test_relay_shows_one_tab())
     asyncio.run(_test_executor_through_relay())

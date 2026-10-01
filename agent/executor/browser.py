@@ -81,6 +81,14 @@ class Executor(Protocol):
     async def stop_screencast(self) -> None: ...
 
 
+def uses_relay() -> bool:
+    """Whether runs attach through the one-tab relay to the user's own Chrome.
+    Such runs share one debugging connection, so only one can run at a time."""
+    cdp_url = os.environ.get("AGENT_CDP_URL", "").strip()
+    profile = os.environ.get("AGENT_CHROME_PROFILE", "").strip()
+    return bool(cdp_url) and (cdp_url.lower() == "auto" or bool(profile))
+
+
 class PlaywrightExecutor:
     """Concrete Executor over Playwright + Chromium.
 
@@ -145,7 +153,7 @@ class PlaywrightExecutor:
         if cdp_url:
             # A personal Chrome (many tabs, several profiles) goes through the
             # relay: Playwright then sees only the one tab the relay opens.
-            if cdp_url.lower() == "auto" or profile:
+            if uses_relay():
                 self._relay = CdpTabRelay(resolve_cdp_url(cdp_url), profile=profile or None)
                 cdp_url = await self._relay.start()
             self._browser = await self._connect_cdp_with_retry(cdp_url)

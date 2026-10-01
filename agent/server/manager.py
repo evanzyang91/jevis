@@ -15,13 +15,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from agent.executor import Frame, PlaywrightExecutor
+from agent.executor import Frame, PlaywrightExecutor, uses_relay
 from agent.memory import InMemoryPlaybook, PlaybookStore
 from agent.planner import build_plan, localise, suggest_url
 from agent.providers import JevClient, adapter_for
 from agent.providers.registry import get
 from agent.supervisor import Supervisor
-from agent.transport import BudgetEvent, Bus, ErrorEvent, FileLogger, FrameEvent, PlanEvent
+from agent.transport import BudgetEvent, Bus, ErrorEvent, FileLogger, FrameEvent, PlanEvent, StatusEvent
 
 if TYPE_CHECKING:
     from agent.transport import Subscription
@@ -59,6 +59,12 @@ class RunManager:
         return run
 
     async def start(self, *, goal: str, url: str, text_model: str, vision_model: str | None = None) -> Run:
+        if uses_relay():
+            # Runs in the user's own Chrome share one debugging connection: the
+            # new run takes priority, and any older run still going stops first.
+            # (A reloaded page forgets its run, but the server keeps driving it.)
+            for older in [r for r in self._runs.values() if r.task is not None and not r.task.done()]:
+                await self._stop_superseded(older)
         run_id = uuid4()
         # Empty start_url signals "the planner picks it". Localisation to a
         # Canadian storefront happens inside _drive so both suggested and
@@ -80,6 +86,19 @@ class RunManager:
                 await run.executor.__aexit__(None, None, None)
             except Exception:  # noqa: BLE001 — best-effort cleanup
                 pass
+
+    async def _stop_superseded(self, run: Run) -> None:
+        """Stop an older run for a newer one, and say so on its stream."""
+        log.info("run %s: stopped, a newer run takes the browser", run.run_id)
+        try:
+            run.bus.publish(StatusEvent(run_id=run.run_id, seq=await run.bus.next_seq(), status="blocked",
+                                        reason="Stopped: a newer task took over the browser."))
+        except Exception:  # noqa: BLE001 — the stop matters more than the notice
+            log.exception("failed to publish superseded status")
+        await self.stop(run.run_id)
+        if run.task is not None:
+            # Let its exit steps run (the relay hands the connection back) before the new run starts.
+            await asyncio.wait({run.task}, timeout=10)
 
     def resume_captcha(self, run_id: UUID, token: str) -> bool:
         run = self._runs.get(run_id)

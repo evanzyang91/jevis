@@ -1,6 +1,6 @@
 """Executor: drive a browser. One page, one CDP session, one contract."""
 
-from .browser import Executor, FakeExecutor, PlaywrightExecutor, with_executor
+from .browser import Executor, FakeExecutor, PlaywrightExecutor, uses_relay, with_executor
 from .kinds import (
     CLOSE_LABEL,
     Action,
@@ -34,5 +34,6 @@ __all__ = [
     "path",
     "start_params",
     "typing_delays",
+    "uses_relay",
     "with_executor",
 ]
