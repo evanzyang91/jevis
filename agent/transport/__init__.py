@@ -1,7 +1,6 @@
 """Typed events and the pub/sub bus that carries them."""
 
 from .bus import Bus, Subscription
-from .logger import DEFAULT_LOG_DIR, FileLogger
 from .events import (
     ActionEvent,
     BudgetEvent,
@@ -18,9 +17,11 @@ from .events import (
     ObservationEvent,
     OutcomeEvent,
     PlanEvent,
+    PlanStep,
     StatusEvent,
     event_from_dict,
 )
+from .logger import DEFAULT_LOG_DIR, FileLogger
 
 __all__ = [
     "ActionEvent",
@@ -41,6 +42,7 @@ __all__ = [
     "ObservationEvent",
     "OutcomeEvent",
     "PlanEvent",
+    "PlanStep",
     "StatusEvent",
     "Subscription",
     "event_from_dict",

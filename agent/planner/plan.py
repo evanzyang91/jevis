@@ -1,15 +1,17 @@
 """Turn one goal into an ordered plan.
 
-The planner runs once at start. It emits a `Plan` — an ordered list of
-sub-goals with a starting URL suggestion — that the supervisor uses to break
-one long run into checkable pieces. Verification confirms each sub-goal is met
-before the plan advances.
+The planner runs once at start. It emits a `Plan`: the actionable steps the
+supervisor tracks one by one (`subgoals`), the standing rules that hold on
+every step (`constraints`, such as "Do not place the order."), the end state
+(`stop_when`), and the URL to start on. The supervisor's ledger
+(`planner/progress.py`) marks each step done or skipped as the run goes.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -17,29 +19,47 @@ from agent.providers import TextAdapter
 
 from .prompts import PLAN_GOAL, SUGGEST_URL
 
+# How a step's completion shows. "add": a committing add (Add to cart / order
+# / bag) lands. "search": a typed query is submitted. "page": the policy says
+# DONE and a cheap verifier confirms it from the page.
+DONE_WHEN = ("add", "search", "page")
+
+# A planner sentence that is a rule for every step, not a step of its own:
+# "If an item is out of stock, ...", "Do not place the order.", "Never ...".
+_CONSTRAINT = re.compile(r"^\s*(if|do not|don't|dont|never|only|keep|avoid|make sure|ensure|unless)\b", re.I)
+_STOP = re.compile(r"^\s*stop\b", re.I)
+_ADDS = re.compile(r"\badd\b.*\b(cart|order|bag|basket|trolley)\b|\badd (one|a|an|two|three|four|five|\d+)\b", re.I)
+_SEARCHES = re.compile(r"^\s*search\b", re.I)
+
 
 @dataclass(frozen=True, slots=True)
 class SubGoal:
-    """One checkable step. `check` is the phrase the verifier reads out of
+    """One actionable step. `check` is the phrase the verifier reads out of
     the page — kept short so the verifier does not weigh unrelated text.
 
-    `search_term` is the exact string to type when this subgoal reaches a
-    search field, or None when the subgoal does not involve typing a search
-    (a stop, a payment forbid, a post-add verification). The planner emits
-    it so the text helper does not have to re-infer the query on every fill.
+    `search_term` is the exact string to type when this step reaches a
+    search field, or None when the step does not involve typing a search.
+    The planner emits it so the text helper does not have to re-infer the
+    query on every fill.
+
+    `done_when` is how the supervisor recognises the step as finished: one
+    of DONE_WHEN.
     """
 
     text: str
     check: str
     search_term: str | None = None
+    done_when: str = "page"
 
 
 @dataclass(slots=True)
 class Plan:
-    """A plan is a list of sub-goals plus the URL to start on.
+    """A plan is a list of steps, the rules that hold on every step, and the
+    URL to start on.
 
-    Mutable on purpose: `repair` may rewrite it and the supervisor tracks the
-    active index directly on this object.
+    Mutable on purpose: the supervisor's ledger rewrites a blocked step in
+    place, and keeps `active_index` in step with its own state for readers
+    that only know the index.
     """
 
     original_goal: str
@@ -47,6 +67,11 @@ class Plan:
     start_url: str
     subgoals: list[SubGoal] = field(default_factory=list)
     active_index: int = 0
+    # Standing rules sent to the policy with every step, never tracked.
+    constraints: list[str] = field(default_factory=list)
+    # The planner's end-state sentence ("Stop when the cart shows ..."). The
+    # supervisor ends the run when every step is done; this is for display.
+    stop_when: str | None = None
 
     @property
     def active(self) -> SubGoal | None:
@@ -65,12 +90,92 @@ class PlannerError(RuntimeError):
     """The planner could not produce a usable plan."""
 
 
-async def build_plan(*, adapter: TextAdapter, goal: str, url: str | None = None) -> Plan:
-    """Refine the goal and split it into sub-goals in one call.
+def done_when_for(text: str, search_term: str | None, claimed: object = None) -> str:
+    """The planner's `done_when` when it is valid, else one read from the text:
+    a sentence that adds something is "add", a bare search is "search"."""
+    if _ADDS.search(text):
+        # A step that plainly adds an item completes on the add, whatever the
+        # planner called it: "search" would end it before anything is added.
+        return "add"
+    if isinstance(claimed, str) and claimed.strip().lower() in DONE_WHEN:
+        return claimed.strip().lower()
+    if search_term and _SEARCHES.match(text):
+        return "search"
+    return "page"
 
-    The planner responds with `{goal, subgoals: [{text, check}, ...]}`. The
-    refined goal is what the policy reads on every step; the sub-goals let
-    the verifier acknowledge progress without re-reading the whole goal.
+
+def is_constraint(text: str) -> bool:
+    """Whether a planner sentence is a standing rule rather than a step."""
+    return bool(_CONSTRAINT.match(text))
+
+
+def _parse_step(item: object) -> SubGoal:
+    if not isinstance(item, dict):
+        raise ValueError("step is not an object")
+    text = str(item["text"]).strip()
+    if not text:
+        raise ValueError("empty step")
+    check = str(item.get("check") or "").strip() or text
+    raw_term = item.get("search_term")
+    # Accept missing, null, or an empty string as "no term for this step". A
+    # non-string value is a planner mistake — drop it to the helper instead of
+    # typing a dict into a search field.
+    search_term: str | None = None
+    if isinstance(raw_term, str) and raw_term.strip():
+        search_term = raw_term.strip()
+    return SubGoal(text=text, check=check, search_term=search_term,
+                   done_when=done_when_for(text, search_term, item.get("done_when")))
+
+
+def parse_plan(raw: str, *, goal: str, url: str | None) -> Plan:
+    """Parse the planner's JSON into a Plan.
+
+    Reads `steps` and `constraints` (current format) or a flat `subgoals`
+    list (older format). Either way a sentence that reads as a rule ("If ...",
+    "Do not ...") moves to the constraints and a "Stop when ..." sentence to
+    `stop_when`, so only actionable steps are tracked.
+    """
+    try:
+        parsed = json.loads(raw)
+        refined = parsed["goal"]
+        if not isinstance(refined, str) or not refined.strip():
+            raise ValueError("empty refined goal")
+        items = parsed.get("steps")
+        if items is None:
+            items = parsed["subgoals"]
+        if not isinstance(items, list) or not items:
+            raise ValueError("empty steps")
+        constraints = [str(c).strip() for c in parsed.get("constraints") or [] if str(c).strip()]
+        stop_when = str(parsed.get("stop_when") or "").strip() or None
+        steps: list[SubGoal] = []
+        for item in items:
+            step = _parse_step(item)
+            if _STOP.match(step.text):
+                stop_when = stop_when or step.text
+            elif is_constraint(step.text):
+                constraints.append(step.text)
+            else:
+                steps.append(step)
+        if not steps:
+            raise ValueError("no actionable step")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as err:
+        raise PlannerError(f"Planner returned an unusable plan: {raw[:200]}") from err
+    return Plan(
+        original_goal=goal,
+        refined_goal=refined.strip(),
+        start_url=(url or _fallback_url(goal)),
+        subgoals=steps,
+        constraints=list(dict.fromkeys(constraints)),
+        stop_when=stop_when,
+    )
+
+
+async def build_plan(*, adapter: TextAdapter, goal: str, url: str | None = None) -> Plan:
+    """Refine the goal and split it into steps and constraints in one call.
+
+    The refined goal keeps every sentence, steps and rules both: the purchase
+    guard and the UI read it. The policy reads the ledger's per-step view
+    instead (`planner/progress.py`).
     """
     context = {"goal": goal, "site": url or ""}
     result = await adapter.complete(
@@ -78,36 +183,7 @@ async def build_plan(*, adapter: TextAdapter, goal: str, url: str | None = None)
         user=json.dumps(context),
         json_object=True,
     )
-    try:
-        parsed = json.loads(result.text)
-        refined = parsed["goal"]
-        subgoals_raw = parsed["subgoals"]
-        if not isinstance(refined, str) or not refined.strip():
-            raise ValueError("empty refined goal")
-        if not isinstance(subgoals_raw, list) or not subgoals_raw:
-            raise ValueError("empty subgoals")
-        subgoals: list[SubGoal] = []
-        for item in subgoals_raw:
-            text = item["text"].strip()
-            check = item["check"].strip()
-            if not text or not check:
-                raise ValueError("empty subgoal")
-            raw_term = item.get("search_term")
-            # Accept missing, null, or an empty string as "no term for this
-            # subgoal". A non-string value is a planner mistake — drop it to
-            # the helper instead of typing a dict into a search field.
-            search_term: str | None = None
-            if isinstance(raw_term, str) and raw_term.strip():
-                search_term = raw_term.strip()
-            subgoals.append(SubGoal(text=text, check=check, search_term=search_term))
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as err:
-        raise PlannerError(f"Planner returned an unusable plan: {result.text[:200]}") from err
-    return Plan(
-        original_goal=goal,
-        refined_goal=refined.strip(),
-        start_url=(url or _fallback_url(goal)),
-        subgoals=subgoals,
-    )
+    return parse_plan(result.text, goal=goal, url=url)
 
 
 async def suggest_url(*, adapter: TextAdapter, goal: str) -> str:

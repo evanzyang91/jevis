@@ -14,6 +14,8 @@ from agent.transport import (
     ErrorEvent,
     FrameEvent,
     ObservationEvent,
+    PlanEvent,
+    PlanStep,
     event_from_dict,
 )
 
@@ -101,3 +103,29 @@ def test_action_event_rejects_unknown_kind() -> None:
 def test_event_from_dict_rejects_unknown_kind() -> None:
     with pytest.raises(ValueError):
         event_from_dict({"kind": "nope", "run_id": str(uuid4()), "seq": 0})
+
+
+def test_plan_event_carries_step_progress_and_round_trips() -> None:
+    original = PlanEvent(
+        run_id=uuid4(), seq=7, plan=["Search 'flour' and add one bag.", "Search 'sugar' and add one bag."],
+        active_index=1, constraints=["Do not place the order."], note="step 1 done: added Five Roses Flour",
+        steps=[{"text": "Search 'flour' and add one bag.", "status": "done", "satisfied_by": "added Five Roses Flour",
+                "search_term": "flour", "done_when": "add"},
+               {"text": "Search 'sugar' and add one bag.", "status": "active", "search_term": "sugar",
+                "done_when": "add"}],
+    )
+    assert isinstance(original.steps[0], PlanStep)
+    rebuilt = event_from_dict(original.to_wire())
+    assert rebuilt == original
+    assert [step.status for step in rebuilt.steps] == ["done", "active"]
+
+
+def test_plan_event_without_steps_still_validates() -> None:
+    """Logs and producers from before the ledger send only texts and an index."""
+    event = event_from_dict({"kind": "plan", "run_id": str(uuid4()), "seq": 1, "plan": ["a"], "active_index": 0})
+    assert isinstance(event, PlanEvent) and event.steps == []
+
+
+def test_plan_step_rejects_an_unknown_status() -> None:
+    with pytest.raises(ValidationError):
+        PlanStep(text="a", status="half-done")  # type: ignore[arg-type]

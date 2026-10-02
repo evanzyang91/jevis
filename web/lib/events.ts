@@ -116,6 +116,20 @@ export type FrameEvent = EventBase & {
   device_ratio: number;
 };
 
+export type PlanStepStatus = "pending" | "active" | "done" | "skipped";
+
+// One tracked step, as the supervisor's ledger sees it (agent/planner/progress.py).
+export type PlanStep = {
+  text: string;
+  status: PlanStepStatus;
+  // What finished it ("added Great Value Flour"), or why it was skipped.
+  satisfied_by: string;
+  search_term: string | null;
+  done_when: string;
+};
+
+// Emitted once when the plan is made, then again whenever a step finishes,
+// is skipped, is rewritten, or is reopened. The latest one is current.
 export type PlanEvent = EventBase & {
   kind: "plan";
   plan: string[];
@@ -123,6 +137,10 @@ export type PlanEvent = EventBase & {
   original_goal?: string;
   refined_goal?: string;
   start_url?: string;
+  steps?: PlanStep[];
+  constraints?: string[];
+  stop_when?: string;
+  note?: string;
 };
 
 export type BudgetEvent = EventBase & {
