@@ -28,6 +28,7 @@ from agent.perception.captcha import probe as probe_page
 from agent.planner import MAX_REPAIRS, Change, Plan, Progress, cart_count, is_committing, repair, verify
 from agent.planner.progress import DONE, searched_for
 from agent.policy import Decision, NoFieldValue, decide, field_value, should_escalate
+from agent.policy.jev_policy import in_cart_products, item_for
 from agent.policy.reinstruct import HINT_STEPS, Hint, evidence_present, reinstruct
 from agent.providers import JevClient, TextAdapter
 from agent.transport import (
@@ -151,6 +152,11 @@ class RunState:
     # badge read: a badge rise right after it is an add the label did not show.
     plain_click: str | None = None
     skips_in_a_row: int = 0
+    # Load time of the last executed action, until the next observation has
+    # confirmed what it changed and its OutcomeEvent is published.
+    pending_outcome: int | None = None
+    # The last URL a "page" step was checked on arrival (see `_check_arrival`).
+    arrival_checked: str = ""
 
 
 @dataclass(slots=True)
@@ -219,6 +225,11 @@ class Supervisor:
                     if state.progress.finished():
                         state.status, done_reason = self._finish(state)
                         break
+                if await self._check_arrival(state, observation):
+                    if state.progress is not None and state.progress.finished():
+                        state.status, done_reason = self._finish(state)
+                        break
+                    continue
                 stalled = state.progress.active if state.progress is not None else None
                 if stalled is not None and stalled.actions >= STEP_ACTION_LIMIT:
                     # The policy keeps trying one step without finishing it:
@@ -354,6 +365,17 @@ class Supervisor:
                 count = cart_count([element.name for element in observation.elements])
             changes += progress.on_cart(count, last_click=state.plain_click)
             state.plain_click = None
+            # The page shows the active add step's item already in the cart (a
+            # quantity stepper). The policy withholds every add for it, so the
+            # ledger must finish the step too: a cake run with vanilla in the
+            # cart from an earlier run kept the step open with nothing left to
+            # click, wandered for a minute and crashed.
+            active = progress.active
+            if active is not None and active.step.done_when == "add" and active.term:
+                held = next((product for product in sorted(in_cart_products(observation))
+                             if item_for(f"Add to cart - {product}", [active.term.lower()])), None)
+                if held is not None:
+                    changes.append(progress.complete(active, f"already in the cart: {held}", product=held))
         if any(change.status == DONE for change in changes):
             state.skips_in_a_row = 0
         return changes
@@ -399,6 +421,36 @@ class Supervisor:
         step.rejected_done += 1
         await self._publish_progress(state, f"step {step.index + 1} not finished yet: {result.reason}")
         return False
+
+    async def _check_arrival(self, state: RunState, observation: Observation) -> bool:
+        """A "page" step (open a product, a store, an article) can be met the
+        moment an action lands on a new URL. Check it then, once per URL,
+        instead of waiting for the policy to say DONE: on an Amazon product
+        page that already met the step, the policy clicked the product image,
+        its lightbox and the cart panel for a minute. A miss changes nothing;
+        the policy decides as usual. True when the step was finished."""
+        progress = state.progress
+        if progress is None or not state.history:
+            return False
+        step = progress.active
+        if (step is None or step.step.done_when != "page" or not state.history[-1].url_changed
+                or observation.url == state.arrival_checked):
+            return False
+        state.arrival_checked = observation.url
+        page = "\n".join(part for part in (observation.dialog_text, observation.text) if part)
+        try:
+            result = await verify(adapter=self.text, subgoal_text=step.step.text, check=step.step.check,
+                                  page_text=page, url=observation.url)
+        except Exception as err:  # noqa: BLE001 — no check: the policy decides as usual
+            await self._emit_error("planner", err)
+            return False
+        state.budget.spent(result.model, tokens_in=result.usage["prompt_tokens"],
+                           tokens_out=result.usage["completion_tokens"], latency_ms=result.latency_ms)
+        if not result.met:
+            return False
+        await self._publish_changes(state, [progress.complete(step, f"confirmed on arrival: {result.reason}")])
+        state.skips_in_a_row = 0
+        return True
 
     async def _step_blocked(self, state: RunState, observation: Observation, reason: str = "no way forward",
                             ) -> bool:
@@ -455,6 +507,14 @@ class Supervisor:
             except Exception:  # noqa: BLE001 — a slow reload still leaves a page to read
                 pass
             observation = await observe(page)
+        pending_outcome, state.pending_outcome = state.pending_outcome, None
+        if pending_outcome is not None and state.history and previous is not None:
+            last = state.history[-1]
+            if last.error is None and not last.url_changed and observation.url != previous.url:
+                # The executor's settle ended before the navigation committed
+                # (Amazon's Go and product links: ~250 ms, old URL). The read is
+                # authoritative; the ledger and the loop guards need the move.
+                state.history[-1] = replace(last, url_changed=True, url=observation.url)
         # Effect polling. A click/select/fill sometimes triggers an async
         # effect (cart badge, toast, in-place row swap) that lands after the
         # settle window inside the executor. If the marker did not move,
@@ -524,6 +584,16 @@ class Supervisor:
                 updated = replace(updated, cart_delta=observation.cart_count - before)
             if updated is not last:
                 state.history[-1] = updated
+        if pending_outcome is not None and state.history:
+            last = state.history[-1]
+            await self._publish(OutcomeEvent(
+                run_id=state.run_id,
+                seq=await self.bus.next_seq(),
+                page_changed=last.page_changed,
+                url_changed=last.url_changed,
+                guard_held=True,
+                load_ms=pending_outcome,
+            ))
         # The ledger reads the corrected page_changed: an add the page ignored
         # finishes nothing.
         await self._publish_changes(state, self._track(state, observation))
@@ -609,7 +679,7 @@ class Supervisor:
             confidence=decision.confidence,
             latency_ms=decision.latency_ms,
             model=decision.model,
-            banned=sorted(banned),
+            banned=sorted({*banned, *decision.withheld}),
             offered={op: list(labels) for op, labels in decision.offered.items()},
             dialog=decision.dialog or "",
             dialog_p=decision.dialog_p,
@@ -786,17 +856,13 @@ class Supervisor:
             url=outcome.final_url,
         ))
         # The ledger reads this action at the next observation, once the
-        # reader has confirmed whether the page really changed.
+        # reader has confirmed whether the page really changed. Its
+        # OutcomeEvent waits for that read too: the executor's own flags are
+        # guesses (page_changed always True, url_changed read before a slow
+        # navigation commits).
         state.untracked = (len(state.history) - 1, _item_context(observation))
+        state.pending_outcome = outcome.load_ms
         state.budget.loaded(outcome.load_ms)
-        await self._publish(OutcomeEvent(
-            run_id=state.run_id,
-            seq=await self.bus.next_seq(),
-            page_changed=outcome.page_changed,
-            url_changed=outcome.url_changed,
-            guard_held=True,
-            load_ms=outcome.load_ms,
-        ))
 
     def _bounds_for(self, observation: Observation, action: Action) -> tuple[float, float, float, float] | None:
         """Look up the target element's bounding rect for the cursor overlay."""

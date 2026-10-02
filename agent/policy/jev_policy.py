@@ -95,6 +95,16 @@ _COUNT_THEN_NOT_UNITS = re.compile(
     r"^\s*(?:(?:[a-z-]+\s+){0,2}(?:items?|ingredients?|things?|products?|people|persons?|guests?|servings?|"
     r"kinds?|types?|categories|groceries|sides?|toppings?)\b|(?:kg|g|l|ml|lbs?|oz|%|litres?|liters?|pounds?|"
     r"grams?|kilograms?|ounces?|pack|count|ct)\b|-)", re.I)
+# A price or a rating is not a count: "under $50" once offered every quantity
+# control, and the policy raised a keyboard already in the cart to six.
+_PRICE_BEFORE = re.compile(r"(?:[$€£¥]|\d[.,])\s*$")
+_PRICE_OR_RATING_AFTER = re.compile(
+    r"^(?:[.,]\d+)?\s*\+?\s*(?:dollars?|bucks|cad|usd|cents?|stars?|%|percent|out of\b|reviews?|ratings?)", re.I)
+# Controls that take something out of the cart or a list. Withheld unless the
+# goal asks to remove something: Amazon's cart panel puts "Delete <product>"
+# beside every page.
+_REMOVE_CONTROL = re.compile(r"^(?:delete|remove)\b", re.I)
+_REMOVE_GOAL = re.compile(r"\b(?:remove|delete|empty|clear)\b", re.I)
 
 
 def asks_several(goal: str) -> bool:
@@ -107,6 +117,8 @@ def asks_several(goal: str) -> bool:
         if match.group()[0].isupper() and re.match(r"\s+[A-Z]", after):
             continue
         if _COUNT_OF_PEOPLE_OR_ITEMS.search(goal[:match.start()]) or _COUNT_THEN_NOT_UNITS.match(after):
+            continue
+        if _PRICE_BEFORE.search(goal[:match.start()]) or _PRICE_OR_RATING_AFTER.match(after):
             continue
         return True
     return False
@@ -211,6 +223,9 @@ class Decision:
     vetoed: str | None = None
     # Product adds this step's check scored hopeless (below CHECK_HOPELESS).
     rejected: tuple[str, ...] = ()
+    # Everything withheld from this decision, the policy's own bans included
+    # (duplicates, quantity, detours), so the trace shows why a control was missing.
+    withheld: tuple[str, ...] = ()
 
 
 def _reduced(space: ActionSpace, keep: int) -> ActionSpace:
@@ -333,6 +348,9 @@ async def _decide_once(
     if not asks_several(goal):
         banned = {*banned, *(element.name for element in observation.elements
                              if _QUANTITY_CONTROL.search(element.name or ""))}
+    if not _REMOVE_GOAL.search(goal):
+        banned = {*banned, *(element.name for element in observation.elements
+                             if _REMOVE_CONTROL.match(element.name or ""))}
     diagnosis = await diagnose_dialog(client=client, observation=observation, goal=goal)
     dialog = diagnosis[0] if diagnosis and diagnosis[1] >= DIALOG_KIND_MIN else None
     if dialog == "task" and not (hint_control and CLOSE_LABEL.match(hint_control)):
@@ -515,6 +533,7 @@ async def _decide_once(
         switched=switched,
         committing=action is not None and commits_product(action.label or ""),
         rejected=rejected,
+        withheld=tuple(sorted(banned)),
     )
 
 
@@ -589,6 +608,8 @@ def item_for(label: str, items: list[str]) -> str | None:
 # A product already in the cart shows a quantity stepper instead of its add
 # control: "Decrease quantity Great Value Spaghetti Pasta, Current Quantity 1".
 _IN_CART = re.compile(r"^(?:decrease|increase|remove|update) quantity (?:of )?(.+?),\s*current quantity [1-9]", re.I)
+# Amazon's cart panel: "Increase quantity by one, Quantity is 1, Logitech M185 ...".
+_IN_CART_AMAZON = re.compile(r"^(?:decrease|increase) quantity by one,\s*quantity is [1-9]\d*,\s*(.+)$", re.I)
 
 
 def in_cart_products(observation: Observation | None) -> set[str]:
@@ -596,7 +617,7 @@ def in_cart_products(observation: Observation | None) -> set[str]:
     if observation is None:
         return set()
     return {match.group(1).strip() for element in observation.elements
-            if (match := _IN_CART.match(element.name or ""))}
+            if (match := _IN_CART.match(element.name or "") or _IN_CART_AMAZON.match(element.name or ""))}
 
 
 def finished_items(goal: str, history: Iterable[Mapping[str, Any]],

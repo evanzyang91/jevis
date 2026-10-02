@@ -29,6 +29,9 @@ from playwright.async_api import (
     async_playwright,
 )
 from playwright.async_api import (
+    Error as PlaywrightError,
+)
+from playwright.async_api import (
     TimeoutError as PlaywrightTimeout,
 )
 
@@ -504,7 +507,7 @@ class PlaywrightExecutor:
             elif action.kind == "scroll":
                 await self._scroll(action)
             elif action.kind == "back":
-                await self.page.go_back(wait_until="domcontentloaded")
+                await self._back()
             elif action.kind == "enter":
                 await self._enter()
             elif action.kind == "wait":
@@ -550,6 +553,18 @@ class PlaywrightExecutor:
             load_ms=load_ms,
             final_url=self.page.url,
         )
+
+    async def _back(self) -> None:
+        """History back. A back the page interrupts (net::ERR_ABORTED: a redirect
+        or a script navigation took over) still moved the page, and ended a cake
+        run as an error on its 57th step. The next read shows where it landed."""
+        try:
+            await self.page.go_back(wait_until="domcontentloaded")
+        except PlaywrightTimeout:
+            pass
+        except PlaywrightError as err:
+            if "ERR_ABORTED" not in str(err) and "frame was detached" not in str(err):
+                raise
 
     async def _wait_for_settle(self, quiet_ms: int = 150, cap_ms: int = 1500) -> None:
         """Return once the page has been quiet for `quiet_ms`, or after `cap_ms`.

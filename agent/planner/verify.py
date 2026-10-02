@@ -38,7 +38,7 @@ async def verify(
     url: str,
 ) -> VerifyResult:
     """Return one boolean judgement plus a short reason for the trace."""
-    context = {"subgoal": subgoal_text, "check": check, "url": url, "page": page_text[:3000]}
+    context = {"subgoal": subgoal_text, "check": check, "url": url, "page": page_text[:10000]}
     result = await adapter.complete(
         system=VERIFY_SUBGOAL,
         user=json.dumps(context),

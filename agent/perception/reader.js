@@ -580,9 +580,24 @@
   ];
   const marker = hashString(markerParts.join("~"));
 
-  const text = include_text
-    ? (document.body ? document.body.innerText.replace(/\s+/g, " ").trim().slice(0, 6000) : "")
-    : "";
+  // Page text with site chrome taken out, so the content comes first. On an
+  // Amazon product page the skip links, shortcut list, menu and cart panel
+  // filled the first 3000 characters, and the step check never saw the
+  // rating it was asked about. A page that is nearly all chrome keeps it all.
+  const pageText = () => {
+    if (!document.body) return "";
+    const full = document.body.innerText.replace(/\s+/g, " ").trim();
+    let content = full;
+    const chrome = document.querySelectorAll(
+      'header, nav, footer, [role="banner"], [role="navigation"], [role="contentinfo"], #nav-flyout-ewc');
+    for (const el of chrome) {
+      const part = (el.innerText || "").replace(/\s+/g, " ").trim();
+      if (part.length >= 40) content = content.replace(part, " ");
+    }
+    content = content.replace(/\s+/g, " ").trim();
+    return (content.length >= 200 ? content : full).slice(0, 6000);
+  };
+  const text = include_text ? pageText() : "";
 
   // Nothing rendered yet: no controls, no text, and no large frame, canvas
   // or video that could be holding the content. `observe` waits on this
