@@ -137,6 +137,8 @@ export type CaptchaEvent = EventBase & {
   kind: "captcha";
   reason: string;
   resume_token: string;
+  url?: string; // the check page
+  wait_s?: number; // how long the run waits for the person before it stops
 };
 
 export type ErrorEvent = EventBase & {

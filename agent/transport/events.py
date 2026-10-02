@@ -221,6 +221,10 @@ class CaptchaEvent(_EventBase):
     kind: ClassVar[Literal["captcha"]] = "captcha"
     reason: str
     resume_token: str
+    # The check page, and how long the run waits for the person before it
+    # stops. The run resumes by itself once the page is no longer a check.
+    url: str = ""
+    wait_s: int = 0
 
 
 class ErrorEvent(_EventBase):
