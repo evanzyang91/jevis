@@ -347,7 +347,11 @@ class Supervisor:
                 if entry.url_changed and entry.url:
                     changes += progress.on_navigate(entry.url)
         if observation is not None:
-            count = cart_count([element.name for element in observation.elements])
+            # The reader's cart control count first; the names-based parse is
+            # the fallback for a cart control the reader does not recognise.
+            count = observation.cart_count
+            if count is None:
+                count = cart_count([element.name for element in observation.elements])
             changes += progress.on_cart(count, last_click=state.plain_click)
             state.plain_click = None
         if any(change.status == DONE for change in changes):

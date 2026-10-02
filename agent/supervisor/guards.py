@@ -306,15 +306,31 @@ def combined_ban(
     page_changed False, so `already_taken` withholds it on this page and
     `inert_labels` after its second refusal anywhere.
     """
+    looping = (set(cycling_labels(history)) | set(repeated_label(history))
+               | set(inert_labels(history)))
     return (
         set(already_taken(history, marker))
         | set(covered)
-        | set(cycling_labels(history))
-        | set(repeated_label(history))
-        | set(inert_labels(history))
+        | _scoped_to_use(history, looping)
         | set(refill_bans(history))
         | set(wait_bans(history))
     )
+
+
+def _scoped_to_use(history: Sequence[HistoryEntry], labels: set[str]) -> set[str]:
+    """Ban each looping label only under the operations it looped with.
+
+    Walmart's search box and its submit button are both named "Search". Two
+    clicks on the button that left the URL alone made the bare label "Search"
+    inert, which also hid the box, and every live run then spent 14-16 steps
+    with no way to type the next item (2026-10-01). A label never used in the
+    history keeps the plain ban.
+    """
+    scoped: set[str] = set()
+    for label in labels:
+        operations = {entry.operation for entry in history if entry.action_label == label}
+        scoped |= {f"{operation}:{label}" for operation in operations} or {label}
+    return scoped
 
 
 # ---- Purchase guard ---------------------------------------------------------
