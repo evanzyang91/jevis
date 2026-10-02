@@ -32,8 +32,10 @@ class Store:
     """A store page the executor drives. Every action that does something
     moves the marker, as a real page would."""
 
-    def __init__(self, stock: dict[str, list[str]], *, cart: int = 11, adds_land: bool = True) -> None:
+    def __init__(self, stock: dict[str, list[str]], *, cart: int = 11, adds_land: bool = True,
+                 adds_inert: bool = False) -> None:
         self.stock, self.cart, self.adds_land = stock, cart, adds_land
+        self.adds_inert = adds_inert  # an add click the page ignores: nothing moves
         self.query = ""  # what the search box holds
         self.searched = ""  # what the results page shows
         self.added: list[str] = []
@@ -53,6 +55,9 @@ class Store:
                            can_scroll_up=False, can_scroll_down=False, viewport=(1280, 800))
 
     def act(self, action: Action) -> Outcome:
+        if self.adds_inert and action.label.startswith("Add to cart - "):
+            # The executor's coarse signal still says the page changed.
+            return Outcome(page_changed=True, url_changed=False, load_ms=0, final_url=self.observation().url)
         self.ticks += 1
         url_changed = False
         if action.kind == "fill":
@@ -236,3 +241,26 @@ async def test_without_a_plan_done_ends_the_run_as_before(monkeypatch: pytest.Mo
     state, _, _, _ = await _run(Store(STOCK), None, policy, monkeypatch)
     assert state.status == "done"
     assert policy.goals == ["Buy flour."]
+
+
+@pytest.mark.asyncio
+async def test_an_add_the_page_ignored_finishes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The executor reports a change, the reader's marker does not move: the
+    corrected history entry, not the executor's guess, feeds the ledger."""
+
+    class FastClock:  # the effect poll waits up to 3 s for the marker; skip the wait
+        now = 0.0
+
+        @classmethod
+        def monotonic(cls) -> float:
+            cls.now += 1.0
+            return cls.now
+
+    monkeypatch.setattr(loop, "time", FastClock)
+    state, published, store, _ = await _run(Store({"eggs": ["Large Eggs"]}, adds_inert=True), _plan(["eggs"]),
+                                            Shopper(), monkeypatch)
+    assert store.added == []
+    assert state.status == "blocked"
+    assert all(step.status != "done" for event in published if isinstance(event, PlanEvent) for step in event.steps)
+    status = [e for e in published if isinstance(e, StatusEvent)][-1]
+    assert "0 of 1 steps done" in status.reason and "not reached eggs" in status.reason

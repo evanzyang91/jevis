@@ -37,10 +37,16 @@ def replay(path: Path) -> Progress | None:
     step = 0
     action = None
     last_click: str | None = None
+    navigated = False  # the last action changed the URL: the next observation shows where to
     for event in events:
         kind = event["kind"]
         if kind == "observation":
             step += 1
+            if navigated:
+                navigated = False
+                for change in progress.on_navigate(event["url"]):
+                    print(f"  obs {step:2}: {event['url'][:60]} -> step {change.index + 1} {change.status}: "
+                          f"{change.note}")
             count = cart_count([el[2] for el in event.get("elements", [])])
             for change in progress.on_cart(count, last_click=last_click):
                 print(f"  obs {step:2}: cart={count} -> step {change.index + 1} {change.status}: {change.note}")
@@ -58,8 +64,7 @@ def replay(path: Path) -> Progress | None:
                     changes += progress.on_add(label)
                     if not changes:
                         print(f"  act {step:2}: {label!r} -> {progress.notes[-1]}")
-            if event["url_changed"]:
-                changes += progress.on_navigate(progress.plan.start_url)
+            navigated = bool(event["url_changed"])
             for change in changes:
                 print(f"  act {step:2}: {label[:60]!r} -> step {change.index + 1} {change.status}: {change.note}")
             action = None
