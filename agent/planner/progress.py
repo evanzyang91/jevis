@@ -139,6 +139,10 @@ class StepState:
     # Policy DONE claims the verifier rejected, and rewrites after BLOCKED.
     rejected_done: int = 0
     repairs: int = 0
+    # Actions taken while this step was active, since it became active or
+    # was last rewritten. The supervisor treats a step that stays open too
+    # long as blocked, even when the policy never says BLOCKED.
+    actions: int = 0
     # A query was typed while this step was active.
     typed: bool = False
 
@@ -254,7 +258,7 @@ class Progress:
         return Change(state.index, SKIPPED, state.satisfied_by)
 
     def rewrite(self, state: StepState, step: SubGoal) -> Change:
-        state.step, state.typed = step, False
+        state.step, state.typed, state.actions = step, False, 0
         state.repairs += 1
         self.plan.subgoals[state.index] = step
         self._sync()
@@ -268,7 +272,7 @@ class Progress:
                 s.status = PENDING
         if active is not None:
             if active.status != ACTIVE:
-                active.typed = False
+                active.typed, active.actions = False, 0
             active.status = ACTIVE
         self.plan.active_index = active.index if active is not None else len(self.steps)
 
@@ -331,6 +335,13 @@ class Progress:
             return default  # two steps fit equally well: keep the active one
         pick = ranked[0]
         return None if pick.status == DONE else pick
+
+    def on_action(self) -> StepState | None:
+        """One action was taken on the active step; returns that step."""
+        active = self.active
+        if active is not None:
+            active.actions += 1
+        return active
 
     def on_fill(self, text: str | None) -> None:
         active = self.active

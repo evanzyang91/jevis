@@ -8,6 +8,7 @@ supervisor composes. The verifier and repair calls are stand-ins too.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -93,10 +94,11 @@ class Shopper:
     """A stand-in policy that does exactly the current step: type the step's
     item, submit, add the first result. Records every goal it was given."""
 
-    def __init__(self, *, block_on: set[str] | None = None, done_on: set[str] | None = None) -> None:
+    def __init__(self, *, block_on: set[str] | None = None, done_on: set[str] | None = None,
+                 thrash: bool = False) -> None:
         self.goals: list[str] = []
         self.banned: list[set[str]] = []
-        self.block_on, self.done_on = block_on or set(), done_on or set()
+        self.block_on, self.done_on, self.thrash = block_on or set(), done_on or set(), thrash
 
     async def __call__(self, *, observation: Observation, goal: str, banned: Any, **_: Any) -> Decision:
         self.goals.append(goal)
@@ -117,7 +119,12 @@ class Shopper:
         if term not in observation.url.replace("+", " "):
             return _decision("CLICK", by_name[("button", "Search")])
         adds = [e for e in observation.elements if e.name.startswith("Add to cart - ")]
-        return _decision("CLICK", adds[0]) if adds else _decision("BLOCKED")
+        if adds:
+            return _decision("CLICK", adds[0])
+        if self.thrash:  # keep looking, never admit BLOCKED (live run 27280578)
+            scroll = Action(id="SCROLL_DOWN", kind="scroll", label="Scroll down", delta=600)
+            return replace(_decision("SCROLL_DOWN"), action=scroll)
+        return _decision("BLOCKED")
 
 
 def _plan(terms: list[str]) -> Plan:
@@ -208,6 +215,22 @@ async def test_an_impossible_step_is_rewritten_once_then_skipped(monkeypatch: py
     assert "skipped double-acting baking powder (no way forward on" in status.reason
     notes = [e.note for e in published if isinstance(e, PlanEvent)]
     assert any("rewritten" in note for note in notes) and any("skipped" in note for note in notes)
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_stalls_is_handled_as_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Green onions are not stocked and the policy keeps scrolling without
+    ever saying BLOCKED. After STEP_ACTION_LIMIT actions the step goes to
+    repair (here: skip) and the run finishes the oil."""
+    stock = {"rice": ["Great Value Long Grain White Rice"], "vegetable oil": ["Mazola Corn Oil"]}
+    state, published, store, _ = await _run(Store(stock), _plan(["rice", "green onions", "vegetable oil"]),
+                                            Shopper(thrash=True), monkeypatch)
+    assert state.status == "done"
+    assert store.added == ["Great Value Long Grain White Rice", "Mazola Corn Oil"]
+    status = [e for e in published if isinstance(e, StatusEvent)][-1]
+    assert status.reason.startswith("2 of 3 steps done") and "skipped green onions (not sold here)" in status.reason
+    # rice: type, submit, add; onions: type, submit, then scrolls up to the limit; oil: type, submit, add.
+    assert state.budget.steps == 3 + loop.STEP_ACTION_LIMIT + 3
 
 
 @pytest.mark.asyncio

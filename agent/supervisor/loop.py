@@ -68,6 +68,11 @@ MAX_SKIPS_IN_A_ROW = 3
 # Wait before re-reading the cart badge when the run's last add has not shown
 # on it yet.
 CART_SETTLE_S = 1.5
+# Actions on one step (per attempt) before it counts as blocked even though
+# the policy never said BLOCKED: rewritten once, then skipped. Live Walmart
+# items took 3-5 actions; a run thrashing on "green onions" (no such product)
+# spent 25+ without ever choosing BLOCKED (2026-10-01, run 27280578).
+STEP_ACTION_LIMIT = 16
 
 
 def plan_event(run_id: UUID, seq: int, plan: Plan, progress: Progress | None = None, note: str = "") -> PlanEvent:
@@ -196,6 +201,20 @@ class Supervisor:
                     if state.progress.finished():
                         state.status, done_reason = self._finish(state)
                         break
+                stalled = state.progress.active if state.progress is not None else None
+                if stalled is not None and stalled.actions >= STEP_ACTION_LIMIT:
+                    # The policy keeps trying one step without finishing it:
+                    # handle it as BLOCKED (rewrite once, then skip).
+                    keep_going = await self._step_blocked(
+                        state, observation, reason=f"no progress after {stalled.actions} actions")
+                    if state.progress.finished():
+                        state.status, done_reason = self._finish(state)
+                        break
+                    if keep_going:
+                        continue
+                    state.status = "blocked"
+                    done_reason = self._with_progress(state, "steps keep stalling")
+                    break
                 if is_blocked_tail(state.history):
                     state.status = "blocked"
                     done_reason = self._with_progress(state, "no action changed the page over 4 steps")
@@ -246,6 +265,8 @@ class Supervisor:
                     break
                 await self._act(state, observation, decision)
                 state.budget.stepped()
+                if state.progress is not None:
+                    state.progress.on_action()
         except asyncio.CancelledError:
             # Stop button, server shutdown, or a newer run superseding this
             # one. CancelledError is a BaseException, so the `except Exception`
@@ -357,16 +378,18 @@ class Supervisor:
         await self._publish_progress(state, f"step {step.index + 1} not finished yet: {result.reason}")
         return False
 
-    async def _step_blocked(self, state: RunState, observation: Observation) -> bool:
-        """The policy said BLOCKED on the active step. Rewrite the step once
-        (a broader search, the closest equivalent), else skip it. True when the
-        run goes on; False when steps keep blocking and the run should end."""
+    async def _step_blocked(self, state: RunState, observation: Observation, reason: str = "no way forward",
+                            ) -> bool:
+        """The active step is blocked: the policy said BLOCKED, or the step
+        stalled. Rewrite the step once (a broader search, the closest
+        equivalent), else skip it. True when the run goes on; False when steps
+        keep blocking and the run should end."""
         progress = state.progress
         assert progress is not None
         step = progress.active
         if step is None:
             return False
-        reason = f"no way forward on {observation.url}"
+        reason = f"{reason} on {observation.url}"
         if step.repairs < MAX_REPAIRS:
             fix = None
             try:
