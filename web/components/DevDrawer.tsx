@@ -3,7 +3,7 @@
 // Developer view: what the agent saw, how sure it was, and what each action did.
 
 import type { DecisionEvent, FrameEvent } from "@/lib/events";
-import { type Run, isTerminal, percent, plainly, seconds, stepText, targetIndex } from "@/lib/run";
+import { type Run, fromMemory, isTerminal, percent, plainly, seconds, stepText, targetIndex } from "@/lib/run";
 
 import type { CursorRegistry } from "./cursor";
 import { LiveBrowser } from "./LiveBrowser";
@@ -231,7 +231,9 @@ function Trail({ run }: { run: Run | null }) {
                 {stepText(step)}
                 {step.action.target_label && step.action.action_kind !== "click" && <small>{step.action.target_label}</small>}
               </div>
-              <span className="num">{step.decision ? `${step.decision.latency_ms} ms` : "–"}</span>
+              <span className="num">
+                {fromMemory(step) ? "memory" : step.decision ? `${step.decision.latency_ms} ms` : "–"}
+              </span>
               <span className="num">{step.outcome ? `${step.outcome.load_ms} ms` : "–"}</span>
               <span className="num">{step.decision ? percent(step.decision.confidence) : "–"}</span>
               <span className={`num effect ${step.outcome && !step.outcome.page_changed ? "none" : ""}`}>

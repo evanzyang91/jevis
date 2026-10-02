@@ -4,7 +4,17 @@
 // words, the verdict, and a results card once the run ends.
 
 import type { FrameEvent } from "@/lib/events";
-import { type HumanCheck, type Run, hostOf, isTerminal, money, plainly, stepText, waitingCheck } from "@/lib/run";
+import {
+  type HumanCheck,
+  type Run,
+  fromMemory,
+  hostOf,
+  isTerminal,
+  money,
+  plainly,
+  stepText,
+  waitingCheck,
+} from "@/lib/run";
 
 import type { CursorRegistry } from "./cursor";
 import { LiveBrowser } from "./LiveBrowser";
@@ -70,6 +80,7 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
                 {run.steps.map((step) => (
                   <li key={step.action.seq} className={step.outcome?.page_changed === false ? "failed" : ""}>
                     {stepText(step)}
+                    {fromMemory(step) && <small className="memo">from memory</small>}
                   </li>
                 ))}
               </ol>
@@ -172,6 +183,11 @@ function Results({ run }: { run: Run }) {
         <Tile label="Time" value={`${(elapsed / 1000).toFixed(1)}s`} />
         <Tile label="Model" value={`${((budget?.model_ms ?? run.modelMs) / 1000).toFixed(1)}s`} note="thinking" />
         <Tile label="Pages" value={`${((budget?.load_ms ?? 0) / 1000).toFixed(1)}s`} note="loading" />
+        <Tile
+          label="Memory"
+          value={String(run.steps.filter(fromMemory).length)}
+          note={`of ${run.steps.length} steps reused`}
+        />
       </div>
     </div>
   );

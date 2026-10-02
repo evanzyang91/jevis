@@ -189,6 +189,11 @@ export function reduce(run: Run, event: StreamEvent): Run {
 // Flour"): precise, but not for reading. Keep the part before " · ".
 const short = (label: string) => (label || "").split(" · ")[0].trim();
 
+// Steps decided without asking the model: reused from earlier runs.
+export function fromMemory(step: Step): boolean {
+  return step.decision?.model === "memory";
+}
+
 export function stepText(step: Step): string {
   const label = short(step.action.target_label);
   switch (step.action.action_kind) {
@@ -204,6 +209,8 @@ export function stepText(step: Step): string {
       return "Went back";
     case "enter":
       return "Submitted";
+    case "navigate":
+      return `Opened ${label}`;
     default:
       return `Clicked ${label}`;
   }
@@ -227,6 +234,8 @@ export function plainly(decision: DecisionEvent | null, observation: Observation
       return "Going back";
     case "ENTER":
       return "Submitting";
+    case "NAVIGATE":
+      return "Opening the search results";
     case "DONE":
       return "Checking the result";
     case "BLOCKED":

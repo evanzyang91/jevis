@@ -474,6 +474,21 @@ class Supervisor:
         except Exception as err:  # noqa: BLE001 — memory never stops a run
             log.warning("playbook record failed: %s", err)
 
+    def _learn_search(self, state: RunState, entry: HistoryEntry, observation: Observation) -> None:
+        """A search the agent typed and submitted teaches the site's results
+        URL; a remembered one that did not land on results counts against it."""
+        active = state.progress.active if state.progress is not None else None
+        if self.recall is None or active is None or not active.term or not entry.url_changed:
+            return
+        host = _host(observation.url)
+        landed = searched_for(observation.url, active.term)
+        if entry.operation == "NAVIGATE":
+            if not landed:
+                self.recall.search_failed(_host(entry.url) or host)
+                state.recall_failed.add(f"search|{host}")
+        elif landed and entry.operation in {"TYPE_TEXT", "CLICK", "ENTER"}:
+            self.recall.keep_search(host, observation.url, active.term)
+
     async def _recall(self, state: RunState, observation: Observation) -> Decision | None:
         """A move from memory instead of a model decision, when memory is sure:
         - the product an earlier run's search for this step's term finished
@@ -486,12 +501,21 @@ class Supervisor:
         active = progress.active if progress is not None else None
         if active is None or state.hint is not None or (self.playbook is None and self.recall is None):
             return None
+        host = _host(observation.url)
+        if (self.recall is not None and active.term and active.step.done_when in {"add", "search"}
+                and observation.scroll_area != "dialog" and not searched_for(observation.url, active.term)
+                and f"search|{host}" not in state.recall_failed):
+            # Open the step's results directly: one page load in place of
+            # typing the term and pressing Search.
+            url = self.recall.search_url(host, active.term)
+            if url and url != observation.url:
+                action = Action(id="navigate", kind="navigate", label=f"Search results for {active.term}", value=url)
+                return await self._scripted(state, "NAVIGATE", None, action, model="memory")
         goal = self._policy_goal(state)
         history = self._history_for_policy(state)
         space = build(observation)
         banned = combined_ban(state.history, observation.marker, covered=state.covered)
         banned = _search_left_open(state, observation, banned | policy_bans(observation, goal, history, space))
-        host = _host(observation.url)
         pick = None
         if self.recall is not None and active.step.done_when == "add" and active.term:
             product = self.recall.product(host, active.term)
@@ -776,6 +800,7 @@ class Supervisor:
         if pending_outcome is not None and state.history:
             last = state.history[-1]
             await self._learn_move(state, last)
+            self._learn_search(state, last, observation)
             await self._publish(OutcomeEvent(
                 run_id=state.run_id,
                 seq=await self.bus.next_seq(),
@@ -1343,7 +1368,8 @@ class Supervisor:
 
 
 _OPERATION_KIND = {"TYPE_TEXT": "fill", "CLICK": "click", "SELECT": "select", "SCROLL_UP": "scroll",
-                   "SCROLL_DOWN": "scroll", "BACK": "back", "ENTER": "enter", "WAIT": "wait"}
+                   "SCROLL_DOWN": "scroll", "BACK": "back", "ENTER": "enter", "WAIT": "wait",
+                   "NAVIGATE": "navigate"}
 
 
 def _situation(state: RunState, observation: Observation) -> tuple[str, str] | None:

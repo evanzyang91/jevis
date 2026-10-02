@@ -136,7 +136,7 @@ class DecisionEvent(_EventBase):
 
 class ActionEvent(_EventBase):
     kind: ClassVar[Literal["action"]] = "action"
-    action_kind: Literal["click", "fill", "select", "scroll", "wait", "back", "enter"]
+    action_kind: Literal["click", "fill", "select", "scroll", "wait", "back", "enter", "navigate"]
     target_label: str
     node_id: int | None = None
     text: str | None = None

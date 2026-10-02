@@ -61,7 +61,8 @@ export type ActionEvent = EventBase & {
     | "scroll"
     | "wait"
     | "back"
-    | "enter";
+    | "enter"
+    | "navigate";
   target_label: string;
   node_id: number | null;
   text: string | null;

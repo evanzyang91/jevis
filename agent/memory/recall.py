@@ -6,6 +6,9 @@
 - A product, by site and search term: the one an add step finished with.
   The next run on that site adds it straight from the results when the page
   offers its add control, with no model asked.
+- A site's search results URL ("https://www.walmart.ca/en/search?q={q}"),
+  read off a search the agent typed and submitted. A later step opens its
+  results directly instead of typing and pressing Search.
 
 One JSON file (`AGENT_MEMORY_DIR`, default ~/.cache/agent/memory). Moves
 between pages live in the playbook store beside it (see playbook.py).
@@ -20,6 +23,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, quote_plus, urlsplit, urlunsplit
 
 log = logging.getLogger("agent.memory.recall")
 
@@ -40,6 +44,20 @@ def goal_key(goal: str, url: str = "") -> str:
     return f"{words}|{url.strip().lower()}"
 
 
+def search_template(url: str, term: str) -> str | None:
+    """"https://www.amazon.ca/s?k=wireless+mouse&crid=..." with term "wireless
+    mouse" -> "https://www.amazon.ca/s?k={q}": the path and the one query
+    parameter that holds exactly the term. None when no parameter does."""
+    parts = urlsplit(url)
+    wanted = _term_key(term)
+    if parts.scheme not in {"http", "https"} or not wanted:
+        return None
+    for name, value in parse_qsl(parts.query, keep_blank_values=False):
+        if _term_key(value) == wanted:
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, f"{quote_plus(name)}={{q}}", ""))
+    return None
+
+
 def _term_key(term: str) -> str:
     return re.sub(r"\s+", " ", term.strip().lower())
 
@@ -47,7 +65,7 @@ def _term_key(term: str) -> str:
 class Recall:
     def __init__(self, path: Path | None) -> None:
         self._path = path
-        self._data: dict[str, Any] = {"plans": {}, "products": {}}
+        self._data: dict[str, Any] = {"plans": {}, "products": {}, "searches": {}}
         if path is None:
             return
         try:
@@ -55,6 +73,7 @@ class Recall:
             if isinstance(loaded, dict):
                 self._data["plans"] = dict(loaded.get("plans") or {})
                 self._data["products"] = dict(loaded.get("products") or {})
+                self._data["searches"] = dict(loaded.get("searches") or {})
         except (OSError, ValueError):
             pass
 
@@ -107,6 +126,36 @@ class Recall:
         entry["last"] = time.time()
         site[key] = entry
         self._save()
+
+    # ---- Search URLs -----------------------------------------------------------
+
+    def search_url(self, host: str, term: str) -> str | None:
+        """The results URL for `term` on `host`, while its template has opened
+        results more often than it failed."""
+        entry = self._data["searches"].get(host)
+        if not isinstance(entry, dict) or int(entry.get("ok", 0)) <= int(entry.get("bad", 0)):
+            return None
+        template = str(entry.get("template") or "")
+        return template.replace("{q}", quote_plus(term.strip())) if "{q}" in template else None
+
+    def keep_search(self, host: str, url: str, term: str) -> None:
+        """Learn the template from a results URL whose query holds `term`."""
+        template = search_template(url, term)
+        if not host or template is None:
+            return
+        entry = self._data["searches"].get(host)
+        if not isinstance(entry, dict) or entry.get("template") != template:
+            entry = {"template": template, "ok": 0, "bad": 0}
+        entry["ok"] = int(entry.get("ok", 0)) + 1
+        entry["last"] = time.time()
+        self._data["searches"][host] = entry
+        self._save()
+
+    def search_failed(self, host: str) -> None:
+        entry = self._data["searches"].get(host)
+        if isinstance(entry, dict):
+            entry["bad"] = int(entry.get("bad", 0)) + 1
+            self._save()
 
     # ---- File ----------------------------------------------------------------
 

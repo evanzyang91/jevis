@@ -512,6 +512,9 @@ class PlaywrightExecutor:
                 await self._enter()
             elif action.kind == "wait":
                 await self._wait_quiet()
+            elif action.kind == "navigate":
+                # A remembered search results URL (see the supervisor's memory).
+                await self.page.goto(action.value or "", wait_until="domcontentloaded", timeout=15_000)
         except PlaywrightTimeout as err:
             raise StalePage(f"{action.kind} target vanished before input") from err
         # Click, Enter, Back, and submit-on-fill all frequently trigger
@@ -521,7 +524,7 @@ class PlaywrightExecutor:
         # a slow lazy-rendering results page (Amazon, Walmart) takes up to the
         # cap without stalling.
         submits_fill = action.kind == "fill" and _commits_on_fill(action.role, action.label)
-        if action.kind in {"click", "enter", "back"} or submits_fill:
+        if action.kind in {"click", "enter", "back", "navigate"} or submits_fill:
             await self._wait_for_settle()
         url_changed = self.page.url != before_url
         # A URL change means a new document. Give the SPA router time to

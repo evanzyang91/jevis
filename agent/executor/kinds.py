@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-ActionKind = Literal["click", "fill", "select", "scroll", "wait", "back", "enter"]
+ActionKind = Literal["click", "fill", "select", "scroll", "wait", "back", "enter", "navigate"]
 
 # Labels of controls whose only job is to close a dialog. The executor and the
 # policy share this rule. A bare "x" or "×" closes; "X-Large" is an option.
