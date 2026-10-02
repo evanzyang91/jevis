@@ -522,7 +522,9 @@ async def _child(case: Case, out: Path, run_id: str) -> dict:
     os.environ.pop("AGENT_CHROME_PROFILE", None)  # no relay: the test Chrome, its own tab
     os.environ["AGENT_CLOSE_TAB"] = "0"  # the run's tab stays open: the cart is read there, then it is closed
     timeout_s = float(os.environ.get("E2E_TIMEOUT_S", "900"))
-    record: dict = {"id": case.id, "run": run_id, "goal": case.goal, "note": case.note}
+    record: dict = {"id": case.id, "run": run_id, "goal": case.goal, "note": case.note,
+                    "commit": _git("rev-parse", "--short", "HEAD"),
+                    "dirty": bool(_git("status", "--porcelain", "--untracked-files=no"))}
     # The cart is emptied after every case, in the same visit that reads it, so
     # the next case starts empty with no extra visit before its run. The run's
     # first page shows the cart count it really started with.
