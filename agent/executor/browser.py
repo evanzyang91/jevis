@@ -759,14 +759,21 @@ class PlaywrightExecutor:
         if action.value is None:
             raise ValueError("fill action requires a value")
         locator = await self._locator(action)
-        await locator.focus()
-        await self.page.keyboard.press("ControlOrMeta+A")
-        # One Playwright call with an average per-char delay. This still fires
-        # keydown/keyup for every character (what bot detection watches) but
-        # avoids one IPC round-trip per character.
-        delays = typing_delays(action.value, self._rng)
-        mean_delay = sum(delays) // len(delays) if delays else 0
-        await self.page.keyboard.type(action.value, delay=mean_delay)
+        before_url = self.page.url
+        await self._type_into(locator, action.value)
+        # A navigation the last action started can land mid-typing: Walmart
+        # opens its "added to cart" page about a second after an add, and a
+        # cake run typed "butter", kept "butt", searched it and ended up buying
+        # margarine. Nothing is submitted then; the next decision reads the
+        # new page and types again.
+        if self.page.url != before_url:
+            raise StalePage("The page navigated while typing; nothing was submitted")
+        typed = await self._input_value(locator)
+        if typed is not None and typed.strip() != action.value.strip():
+            await self._type_into(locator, action.value)
+            typed = await self._input_value(locator)
+            if self.page.url != before_url or (typed is not None and typed.strip() != action.value.strip()):
+                raise StalePage(f"The field kept {typed!r} instead of {action.value!r}; nothing was submitted")
         # Commit a search fill (see `_commits_on_fill`). Saves one step per
         # search — the model otherwise fills, then separately clicks a Search
         # button — and keeps the loop-progress signal (url_changed) tied to
@@ -780,6 +787,25 @@ class PlaywrightExecutor:
             # keystroke, and an Enter that lands mid-mount is swallowed.
             await asyncio.sleep(0.12)
             await self._submit(locator)
+
+    async def _type_into(self, locator: Locator, text: str) -> None:
+        await locator.focus()
+        await self.page.keyboard.press("ControlOrMeta+A")
+        # One Playwright call with an average per-char delay. This still fires
+        # keydown/keyup for every character (what bot detection watches) but
+        # avoids one IPC round-trip per character.
+        delays = typing_delays(text, self._rng)
+        mean_delay = sum(delays) // len(delays) if delays else 0
+        await self.page.keyboard.type(text, delay=mean_delay)
+
+    @staticmethod
+    async def _input_value(locator: Locator) -> str | None:
+        """The field's value now, or None when it has none to read (a
+        contenteditable) or is gone."""
+        try:
+            return await locator.input_value(timeout=1000)
+        except Exception:  # noqa: BLE001 — unreadable: trust the typing
+            return None
 
     async def _press_enter(self) -> None:
         """A trusted Enter at the focused element, dispatched over CDP (the

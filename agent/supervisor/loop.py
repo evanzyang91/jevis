@@ -57,6 +57,7 @@ from .guards import (
     is_add_label,
     is_blocked_tail,
     reached_purchase,
+    refill_bans,
     stale_over_limit,
     url_cycling,
 )
@@ -627,6 +628,7 @@ class Supervisor:
         """One policy decision on this observation. `ban` adds operations or
         labels to hide for this decision only (DONE after a rejected claim)."""
         banned = combined_ban(state.history, observation.marker, covered=state.covered) | set(ban)
+        banned = _search_left_open(state, observation, banned)
         goal = self._policy_goal(state)
         history_for_policy = [
             {
@@ -1136,6 +1138,31 @@ class Supervisor:
             error_kind=type(err).__name__,
             message=str(err)[:400],
         ))
+
+
+def _search_left_open(state: RunState, observation: Observation, banned: set[str]) -> set[str]:
+    """Never withhold typing the active step's search while the page does not
+    search for it. A cake run's search for "butter" came out as "butt"; its
+    next steps rotated between Search, Scroll and Home, the cycle guard banned
+    all three, the field included, and the step was rewritten to margarine.
+    The field just typed into without a submit stays withheld (`refill_bans`):
+    submitting is the next move then."""
+    active = state.progress.active if state.progress is not None else None
+    if active is None or not active.term or searched_for(observation.url, active.term):
+        return banned
+    just_filled = refill_bans(state.history)
+    kept = set(banned)
+    for element in observation.elements:
+        name = element.name or ""
+        if element.role not in {"searchbox", "combobox"} or not element.editable or not name:
+            continue
+        if f"TYPE_TEXT:{name}" in just_filled or (element.value or "").strip().lower() == active.term.lower():
+            continue  # typing it again changes nothing: submit, or let the guards decide
+        kept.discard(f"TYPE_TEXT:{name}")
+        if name in kept:
+            kept.discard(name)
+            kept.add(f"CLICK:{name}")
+    return kept
 
 
 def _site(url: str) -> str:
