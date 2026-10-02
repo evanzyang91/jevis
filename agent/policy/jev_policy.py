@@ -329,7 +329,7 @@ async def _decide_once(
     # unfamiliar pages: a favourites detour whose label names the item
     # ("Sign in to add to Favourites list, Great Value Soya Sauce", chosen at
     # 0.74), and a second product for an item already in the cart.
-    banned = {*banned, *_detour_bans(observation, goal), *_duplicate_add_bans(space, goal, history)}
+    banned = {*banned, *_detour_bans(observation, goal), *_duplicate_add_bans(space, goal, history, observation)}
     if not asks_several(goal):
         banned = {*banned, *(element.name for element in observation.elements
                              if _QUANTITY_CONTROL.search(element.name or ""))}
@@ -586,8 +586,25 @@ def item_for(label: str, items: list[str]) -> str | None:
     return max(fits, key=lambda item: len(_words(item)), default=None)
 
 
-def finished_items(goal: str, history: Iterable[Mapping[str, Any]]) -> set[str]:
-    """Goal items whose product the history shows added (an add that changed the page)."""
+# A product already in the cart shows a quantity stepper instead of its add
+# control: "Decrease quantity Great Value Spaghetti Pasta, Current Quantity 1".
+_IN_CART = re.compile(r"^(?:decrease|increase|remove|update) quantity (?:of )?(.+?),\s*current quantity [1-9]", re.I)
+
+
+def in_cart_products(observation: Observation | None) -> set[str]:
+    """Products the page shows already in the cart."""
+    if observation is None:
+        return set()
+    return {match.group(1).strip() for element in observation.elements
+            if (match := _IN_CART.match(element.name or ""))}
+
+
+def finished_items(goal: str, history: Iterable[Mapping[str, Any]],
+                   observation: Observation | None = None) -> set[str]:
+    """Goal items whose product the history shows added (an add that changed
+    the page), or the page shows already in the cart. A cart that held
+    spaghetti before the run showed its stepper on the results, and the policy
+    added a second spaghetti (its check cleared 0.90: the history had no add)."""
     items = goal_items(goal)
     done: set[str] = set()
     for entry in history:
@@ -596,14 +613,20 @@ def finished_items(goal: str, history: Iterable[Mapping[str, Any]]) -> set[str]:
             item = item_for(label, items)
             if item is not None:
                 done.add(item)
+    for product in in_cart_products(observation):
+        item = item_for(f"Add to cart - {product}", items)
+        if item is not None:
+            done.add(item)
     return done
 
 
-def _duplicate_add_bans(space: ActionSpace, goal: str, history: Iterable[Mapping[str, Any]]) -> set[str]:
-    """Add controls for an item already added. One cake run put three cartons
-    of eggs in the cart; NEXT_ACTION forbade it in words. A goal that wants
-    several of an item raises the quantity on the product already added."""
-    done = finished_items(goal, history)
+def _duplicate_add_bans(space: ActionSpace, goal: str, history: Iterable[Mapping[str, Any]],
+                        observation: Observation | None = None) -> set[str]:
+    """Add controls for an item already added or already in the cart. One cake
+    run put three cartons of eggs in the cart; NEXT_ACTION forbade it in words.
+    A goal that wants several of an item raises the quantity on the product
+    already added."""
+    done = finished_items(goal, history, observation)
     if not done:
         return set()
     items = goal_items(goal)

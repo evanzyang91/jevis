@@ -107,6 +107,16 @@ async def test_no_second_product_for_an_item_already_added() -> None:
     assert decision.action is not None and decision.action.label == "Add to cart - Great Value Large 12 Eggs"
 
 
+async def test_an_item_the_page_shows_in_the_cart_is_finished() -> None:
+    jev = _Jev()
+    page = _page(["Decrease quantity Great Value Long Grain Rice, Current Quantity 1",
+                  "Increase quantity Great Value Long Grain Rice, Current Quantity 1",
+                  "Add to cart - Minute Rice Long Grain", "Add to cart - Great Value Large 12 Eggs"])
+    await decide(client=jev, observation=page, goal=GOAL, history=[])  # type: ignore[arg-type]
+    assert "Add to cart - Minute Rice Long Grain" not in jev.offered
+    assert "Add to cart - Great Value Large 12 Eggs" in jev.offered
+
+
 async def test_an_add_that_did_not_change_the_page_does_not_finish_the_item() -> None:
     history = [{"operation": "CLICK", "label": "Add to cart - Sitara Basmati Rice", "page_changed": False}]
     jev = _Jev()
