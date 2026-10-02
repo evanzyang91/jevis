@@ -13,18 +13,56 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 from agent.perception import Observation
-from agent.providers import TextAdapter
+from agent.providers import TextAdapter, adapter_for, get
 
+from .jev_policy import commits_product
 from .prompts import REINSTRUCT
 
 log = logging.getLogger("agent.policy.reinstruct")
 
 REINSTRUCT_TIMEOUT_S = 15.0
 HINT_STEPS = 3
+_HINT_ADAPTERS: dict[str, TextAdapter] = {}
+
+
+def hint_adapter(default: TextAdapter) -> TextAdapter:
+    """The text model that writes hints: HINT_MODEL (a registry id) when it is
+    set and its provider's key is present, else the run's own text model.
+    Hints are rare (an escalated step) and decide whether a stuck run
+    recovers, so a stronger model than the per-field helper can pay off."""
+    name = os.environ.get("HINT_MODEL", "").strip()
+    if not name:
+        return default
+    if name not in _HINT_ADAPTERS:
+        try:
+            info = get(name)
+        except KeyError:
+            log.warning("HINT_MODEL %r is not a registry id; hints use the run's text model", name)
+            return default
+        key = "ANTHROPIC_API_KEY" if info.provider == "anthropic" else "OPENAI_API_KEY"
+        if not os.environ.get(key):
+            log.warning("HINT_MODEL %r needs %s; hints use the run's text model", name, key)
+            return default
+        _HINT_ADAPTERS[name] = adapter_for(info.id, info.provider)
+    return _HINT_ADAPTERS[name]
+
+
+def progress(history: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """What the whole run has done, not only its recent tail: every product it
+    added and every query it typed. With only the last 20 actions, hints told
+    a cake run to search flour again 30 steps after flour was added."""
+    added = [str(entry.get("label") or "") for entry in history
+             if entry.get("operation") == "CLICK" and entry.get("page_changed")
+             and commits_product(str(entry.get("label") or ""))]
+    searched = [str(entry["text"]) for entry in history
+                if entry.get("operation") == "TYPE_TEXT" and entry.get("text")]
+    return {"added": added, "searched": searched}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,21 +90,34 @@ def evidence_present(hint: Hint, observation: Observation) -> bool:
 
 async def reinstruct(
     *, adapter: TextAdapter, goal: str, observation: Observation, history: list[dict[str, Any]],
-    policy_pick: str,
+    policy_pick: str, banned: Iterable[str] = (),
 ) -> Hint | None:
     """One hint, or None on timeout or an unusable reply. Never raises: a broken
-    hint must not end a run that the policy can still continue."""
+    hint must not end a run that the policy can still continue. `banned` holds
+    the labels the policy cannot choose now (covered, inert, looping): a hint
+    that names one cannot be followed."""
+    names = {element.name for element in observation.elements}
+    # Operations the guards withhold, as the hint names them. A pasta run's
+    # hints said "scroll down" twenty times while scrolling was banned as inert.
+    blocked_ops = {"SCROLL_DOWN": "scroll down", "SCROLL_UP": "scroll up", "BACK": "back", "ENTER": "enter",
+                   "WAIT": "wait"}
+    banned = set(banned)
     context = {
         "goal": goal,
+        **progress(history),
         "page": {"url": observation.url, "title": observation.title, "text": observation.text[:4000]},
         "dialog": observation.dialog_text or None,
         "controls": [f"{element.role}: {element.name}" for element in observation.elements][:80],
+        "unavailable": [*(word for op, word in blocked_ops.items() if op in banned),
+                        *sorted(label for label in banned if label in names)][:40],
         "recent_actions": history[-20:],
         "policy_pick": policy_pick,
     }
+    adapter = hint_adapter(adapter)
     try:
+        # A reasoning model spends part of the limit before it writes the reply.
         result = await asyncio.wait_for(
-            adapter.complete(system=REINSTRUCT, user=json.dumps(context), json_object=True, max_tokens=600),
+            adapter.complete(system=REINSTRUCT, user=json.dumps(context), json_object=True, max_tokens=1200),
             timeout=REINSTRUCT_TIMEOUT_S,
         )
         parsed = json.loads(result.text)

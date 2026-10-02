@@ -45,18 +45,26 @@ async def field_value(
     current_value: str | None,
     page_text: str,
     history: list[dict[str, Any]],
+    guidance: str | None = None,
 ) -> TextValue:
     """Return one value for one field.
 
     Timeouts convert to `NoFieldValue`. That lets the supervisor drop the
     target and let the policy re-decide (typically toward Enter or a Search
-    button) instead of stalling on a slow provider.
+    button) instead of stalling on a slow provider. `guidance` is the active
+    hint (policy/reinstruct.py): without it a hint saying "search butter"
+    reached the policy, which chose the field, while the value came from a
+    helper that never saw the hint and typed another item.
     """
     context = {
         "goal": goal,
         "field": {"label": field_name, "role": field_role, "current": current_value},
         "page": page_text[:2000],
         "recent_actions": history[-24:],
+        # Every query typed so far, past the recent window: an item searched
+        # 30 steps ago is not a reason to search it again.
+        "typed_before": [entry["text"] for entry in history if entry.get("text")][-12:],
+        **({"guidance": guidance} if guidance else {}),
     }
     try:
         result = await asyncio.wait_for(
