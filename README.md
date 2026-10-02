@@ -72,6 +72,7 @@ Developer view: turn on **Developer** in the page header. It shows the live brow
 - **Black screencast, "Status: starting" forever.** The browser cannot reach the agent server on the WebSocket. Check `web/.env.local` — `NEXT_PUBLIC_AGENT_WS_URL` must match where `uv run agent` is listening (default `ws://127.0.0.1:8787`). Restart `pnpm dev` after editing.
 - **Instant error event.** The Python server logs the reason. Almost always a missing `TYPESAFE_API_KEY` or `ANTHROPIC_API_KEY` in `.env`.
 - **No Chromium window opens.** `uv run playwright install chromium` did not complete. Rerun it, then retry.
+- **"Your turn: … wants to check that you are human."** The site showed a bot check (Walmart's press and hold, Cloudflare, Amazon). The agent never touches it: do the check in the Chrome window (the agent brings that tab to the front; the live view in the UI does not take clicks). The run notices the check is gone and carries on by itself; **Continue now** is there if it does not. Nobody acting stops the run after `AGENT_CAPTCHA_WAIT_S` (default 300 s), and a headless launched browser stops at once, since there is no window to do the check in.
 
 ## Tests
 
@@ -82,7 +83,6 @@ uv run ruff check agent/   # lint
 
 ## What is *not* wired yet
 
-- **CAPTCHA resume flow.** Endpoint accepts the resume token; the supervisor pause is not implemented pending a real captcha in a real run.
 - **Event persistence.** Events flow over WebSocket to the browser. Nothing writes them to `events` in Postgres. Add that after the first real run.
 
 ## Layout at a glance
