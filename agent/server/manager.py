@@ -29,6 +29,24 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("agent.server.manager")
 
+_DEFAULT_CAPTCHA_WAIT_S = 300.0
+
+
+def captcha_wait_s(*, headless: bool) -> float:
+    """How long a run waits for the person to do a site's human check.
+
+    `AGENT_CAPTCHA_WAIT_S` sets it (default five minutes). A headless browser
+    has no window anyone could do the check in, so it gets zero: the run then
+    stops at once and says why, instead of waiting for nobody."""
+    if headless:
+        return 0.0
+    raw = os.environ.get("AGENT_CAPTCHA_WAIT_S", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else _DEFAULT_CAPTCHA_WAIT_S
+    except ValueError:
+        log.warning("AGENT_CAPTCHA_WAIT_S=%r is not a number; waiting %.0fs", raw, _DEFAULT_CAPTCHA_WAIT_S)
+        return _DEFAULT_CAPTCHA_WAIT_S
+
 
 @dataclass
 class Run:
@@ -214,6 +232,10 @@ class RunManager:
                     goal=plan.refined_goal if plan is not None else run.goal,
                     run_id=run.run_id,
                     plan=plan,
+                    # An attached Chrome (AGENT_CDP_URL) keeps its own windows,
+                    # whatever AGENT_HEADLESS says; only a launched one can be windowless.
+                    captcha_wait_s=captcha_wait_s(
+                        headless=headless and not os.environ.get("AGENT_CDP_URL", "").strip()),
                 )
                 run.supervisor = supervisor
                 run.started = True

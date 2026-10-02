@@ -18,10 +18,13 @@ import secrets
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from agent.executor import Action, Executor, Occluded, Outcome, StalePage
-from agent.perception import Observation, detect_captcha, observe
+from agent.perception import CaptchaSignal, Observation, detect_captcha, observe
+from agent.perception.captcha import intended_url, title_signal, url_signal
+from agent.perception.captcha import probe as probe_page
 from agent.planner import MAX_REPAIRS, Change, Plan, Progress, cart_count, is_committing, repair, verify
 from agent.planner.progress import DONE, searched_for
 from agent.policy import Decision, NoFieldValue, decide, field_value, should_escalate
@@ -126,6 +129,9 @@ class RunState:
     budget: Budget = field(default_factory=Budget)
     captcha_resume: asyncio.Event | None = None
     captcha_token: str | None = None
+    # The last page that was not a human check: where the run goes back to
+    # when a check page names no destination of its own.
+    resume_url: str = ""
     # Last cursor position emitted to the UI. The overlay draws from here to
     # the next click's centre so the animation matches the real motion.
     cursor: tuple[float, float] = (640.0, 400.0)
@@ -166,9 +172,15 @@ class Supervisor:
     # search term. None (test harness, no planner) keeps the whole-goal loop:
     # DONE ends the run, BLOCKED ends it, every fill asks the text helper.
     plan: Plan | None = None
+    # How long a human check may wait for the person before the run stops.
+    # Zero means nobody can do the check (a headless browser has no window),
+    # so the run stops at once with that reason instead of waiting.
+    captcha_wait_s: float = 300.0
+    # How often a waiting run looks at the page to see if the check is gone.
+    captcha_poll_s: float = 1.5
 
     async def run(self, start_url: str) -> RunState:
-        state = RunState(run_id=self.run_id, goal=self.goal)
+        state = RunState(run_id=self.run_id, goal=self.goal, resume_url=start_url)
         self.state = state
         if self.plan is not None and self.plan.subgoals:
             state.progress = Progress(self.plan)
@@ -188,8 +200,13 @@ class Supervisor:
                 state.observation = observation
                 signal = detect_captcha(observation)
                 if signal is not None:
-                    await self._pause_for_human(state, signal.reason)
-                    continue
+                    stop_reason = await self._pause_for_human(state, signal)
+                    if stop_reason is not None:
+                        state.status = "blocked"
+                        done_reason = stop_reason
+                        break
+                    continue  # read the page afresh: never decide on the check page
+                state.resume_url = observation.url
                 if state.progress is not None and state.progress.finished():
                     if state.progress.awaiting_cart():
                         # The last add is not on the cart badge yet: one more
@@ -816,21 +833,139 @@ class Supervisor:
 
     # ---- Human hand-off ---------------------------------------------------
 
-    async def _pause_for_human(self, state: RunState, reason: str) -> None:
-        """Emit CaptchaEvent, then block until the UI POSTs the resume token."""
+    async def _pause_for_human(self, state: RunState, signal: CaptchaSignal) -> str | None:
+        """Hand the browser to the person for a human check, wait until the
+        check is gone, and put the run back on the page it was going to.
+
+        The agent never touches the check itself. It brings the check's tab
+        to the front, says so (CaptchaEvent, then a "paused" status), and
+        watches the page without running anything in it. The run continues
+        on its own once the page is no longer a check, or at once when the
+        person presses Continue in the UI (`resume_from_captcha`).
+
+        Returns None when the run can continue, or the reason it must stop:
+        nobody did the check within `captcha_wait_s`, or no person can (a
+        browser with no window).
+        """
+        url = state.observation.url if state.observation is not None else ""
+        host = _site(url)
+        if self.captcha_wait_s <= 0:
+            # Say what was met (wait_s=0: nobody can do it), then stop.
+            await self._publish(CaptchaEvent(run_id=state.run_id, seq=await self.bus.next_seq(),
+                                             reason=signal.reason, resume_token="", url=url, wait_s=0))
+            return (f"{host} asked for a human check, and this browser has no window to do it in "
+                    "(it runs headless). Run with a visible browser to get past the check.")
         state.captcha_resume = asyncio.Event()
         state.captcha_token = secrets.token_urlsafe(16)
         await self._publish(CaptchaEvent(
             run_id=state.run_id,
             seq=await self.bus.next_seq(),
-            reason=reason,
+            reason=signal.reason,
             resume_token=state.captcha_token,
+            url=url,
+            wait_s=int(self.captcha_wait_s),
         ))
-        await self._publish_status(state, "paused", reason)
-        await state.captcha_resume.wait()
-        state.captcha_resume = None
-        state.captcha_token = None
-        await self._publish_status(state, "running", "resumed after human check")
+        await self._publish_status(state, "paused", signal.reason)
+        await self._show_check_tab()
+        try:
+            how = await self._wait_for_check(state)
+        finally:
+            state.captcha_resume = None
+            state.captcha_token = None
+        if how == "timeout":
+            return f"Nobody completed the human check on {host} within {_duration(self.captcha_wait_s)}."
+        await self._publish_status(
+            state, "running", "check completed, continuing" if how == "cleared" else "continued by you")
+        await self._return_to_task(state)
+        return None
+
+    async def _show_check_tab(self) -> None:
+        """Bring the check's tab to the front, so the page the person must act
+        on is the one they see. Best effort: a missing page or a browser that
+        refuses changes nothing else."""
+        page = getattr(self.executor, "page", None)
+        if page is None:
+            return
+        try:
+            await asyncio.wait_for(page.bring_to_front(), timeout=3)
+        except Exception:  # noqa: BLE001 — showing the tab is a courtesy, never a failure
+            pass
+
+    async def _wait_for_check(self, state: RunState) -> str:
+        """Wait until the check is gone ("cleared"), the person presses
+        Continue ("manual"), or the wait runs out ("timeout").
+
+        Each tick is a cheap look (`probe`): the URL and title, plus a digest
+        of the document, read from Playwright's isolated world so nothing in
+        the page sees it. While the URL or title still says "check", nothing
+        else runs. Otherwise a changed document earns one full read, judged
+        by the same `detect_captcha` the run loop uses, so the run resumes
+        exactly when the loop would no longer pause. A full read that still
+        sees a check is not repeated until the document changes again.
+        """
+        assert state.captcha_resume is not None
+        page = getattr(self.executor, "page", None)
+        deadline = time.monotonic() + self.captcha_wait_s
+        confirmed: str | None = None  # digest of a document a full read judged still a check
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout"
+            try:
+                await asyncio.wait_for(state.captcha_resume.wait(), timeout=min(self.captcha_poll_s, remaining))
+                return "manual"
+            except TimeoutError:
+                pass
+            if page is None:
+                continue
+            try:
+                look = await asyncio.wait_for(probe_page(page), timeout=5)
+            except Exception:  # noqa: BLE001 — mid-navigation: look again next tick
+                continue
+            if url_signal(look.url) is not None or title_signal(look.title) is not None:
+                continue
+            if look.digest == confirmed:
+                continue
+            try:
+                observation = await self._observe(state)
+            except Exception:  # noqa: BLE001 — the page moved under the read: next tick
+                continue
+            state.observation = observation
+            if detect_captcha(observation) is None:
+                return "cleared"
+            try:
+                # The full read marks controls, which changes the document;
+                # remember the marked one so the next tick does not read again.
+                confirmed = (await asyncio.wait_for(probe_page(page), timeout=5)).digest
+            except Exception:  # noqa: BLE001
+                confirmed = look.digest
+
+    async def _return_to_task(self, state: RunState) -> None:
+        """After the person's turn, put the run back where it was going.
+
+        A check page often replaced the page the run asked for (Walmart's
+        `/blocked?url=L2Vu` stands in for `/en`). When the tab still shows a
+        check page (Continue pressed while the check was up, or the site did
+        not send the person on), go to the page the check names, or else the
+        last page the run saw before it. Otherwise the person or the site
+        already left the check, and the run carries on from there."""
+        page = getattr(self.executor, "page", None)
+        if page is None:
+            return
+        current = page.url
+        try:
+            title = await asyncio.wait_for(page.title(), timeout=3)
+        except Exception:  # noqa: BLE001
+            title = ""
+        if url_signal(current) is None and title_signal(title) is None:
+            return
+        target = intended_url(current) or state.resume_url
+        if not target:
+            return
+        try:
+            await self.executor.navigate(target)
+        except Exception as err:  # noqa: BLE001 — the next read shows wherever the tab is
+            await self._emit_error("executor", err)
 
     def resume_from_captcha(self, token: str) -> bool:
         """Called from the server's resume-captcha endpoint. Returns whether
@@ -854,6 +989,21 @@ class Supervisor:
             error_kind=type(err).__name__,
             message=str(err)[:400],
         ))
+
+
+def _site(url: str) -> str:
+    """"walmart.ca" from "https://www.walmart.ca/blocked?...", for messages."""
+    host = (urlparse(url).hostname or "").lower()
+    return (host[4:] if host.startswith("www.") else host) or "the site"
+
+
+def _duration(seconds: float) -> str:
+    """"5 minutes", "1 minute", "45 seconds"."""
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    whole = int(seconds)
+    return f"{whole} second{'s' if whole != 1 else ''}"
 
 
 # ---- Test hook -----------------------------------------------------------
