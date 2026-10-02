@@ -631,6 +631,9 @@ class Supervisor:
         url = state.observation.url if state.observation is not None else ""
         host = _site(url)
         if self.captcha_wait_s <= 0:
+            # Say what was met (wait_s=0: nobody can do it), then stop.
+            await self._publish(CaptchaEvent(run_id=state.run_id, seq=await self.bus.next_seq(),
+                                             reason=signal.reason, resume_token="", url=url, wait_s=0))
             return (f"{host} asked for a human check, and this browser has no window to do it in "
                     "(it runs headless). Run with a visible browser to get past the check.")
         state.captcha_resume = asyncio.Event()

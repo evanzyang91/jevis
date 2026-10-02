@@ -224,7 +224,8 @@ async def test_headless_stops_at_once_instead_of_waiting_for_nobody(decided: lis
     assert state.status == "blocked"
     status, reason = _statuses(events)[-1]
     assert status == "blocked" and "headless" in reason and "walmart.ca" in reason
-    assert not any(e.kind == "captcha" for e in events)
+    assert _captcha(events).wait_s == 0  # the UI is told what was met, and that nobody can do it
+    assert "paused" not in [s for s, _ in _statuses(events)]
     assert site.page.fronted == 0
 
 

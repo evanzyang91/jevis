@@ -47,7 +47,8 @@ const EXAMPLES: { text: string; url: string; icon: string }[] = [
 const STATUS_LINE: Record<Run["status"], string> = {
   starting: "Planning the task and opening the browser…",
   running: "Running…",
-  paused: "Paused · needs you",
+  // The only pause is a site's human check, done by the person in Chrome.
+  paused: "Your turn: complete the check in the Chrome window. The run continues automatically.",
   done: "Finished. Check the result.",
   blocked: "Stopped. It could not find a way forward.",
   error: "Paused · needs attention",
@@ -213,13 +214,19 @@ export default function Home() {
     await fetch(`/api/runs/${current.id}/stop`, { method: "POST" });
   };
 
+  // Manual override for a human check: the run normally notices by itself
+  // that the check is done. A 410 means it already carried on.
   const resumeCaptcha = async () => {
     if (!current?.captcha) return;
-    await fetch(`/api/runs/${current.id}/resume-captcha`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ resume_token: current.captcha.resume_token }),
-    });
+    try {
+      await fetch(`/api/runs/${current.id}/resume-captcha`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ resume_token: current.captcha.resume_token }),
+      });
+    } catch {
+      setError("Cannot reach the agent server to continue the run.");
+    }
   };
 
   const toggleDev = (on: boolean) => {

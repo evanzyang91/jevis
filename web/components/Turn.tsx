@@ -4,7 +4,7 @@
 // words, the verdict, and a results card once the run ends.
 
 import type { FrameEvent } from "@/lib/events";
-import { type Run, hostOf, isTerminal, money, plainly, stepText } from "@/lib/run";
+import { type HumanCheck, type Run, hostOf, isTerminal, money, plainly, stepText, waitingCheck } from "@/lib/run";
 
 import type { CursorRegistry } from "./cursor";
 import { LiveBrowser } from "./LiveBrowser";
@@ -22,6 +22,8 @@ type Props = {
 export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props) {
   const running = !isTerminal(run);
   const url = run.observation?.url ?? run.plan?.start_url ?? "";
+  // The person's turn: a site's human check is up in the Chrome window.
+  const check = run.status === "paused" && run.captcha ? waitingCheck(run) : null;
   return (
     <>
       <div className="turn user">
@@ -41,8 +43,11 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
               it and never push it around — layout stays stable, and the
               sticky offset keeps it visible while the step list scrolls. */}
           {showBrowser && (
-            <div className={`turn-browser ${running ? "running" : ""}`}>
+            <div className={`turn-browser ${running ? "running" : ""} ${check ? "handoff" : ""}`}>
               <LiveBrowser frame={frame} url={url} live={running} cursor={cursor} />
+              {/* Over the live view, which is sticky and so always on screen,
+                  and which looks like a browser but takes no clicks. */}
+              {check && <CheckNotice check={check} onContinue={onResumeCaptcha} overlay />}
             </div>
           )}
           {running && (
@@ -50,10 +55,11 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
               {run.status === "starting"
                 ? "Planning and opening the browser"
                 : run.status === "paused"
-                  ? "Waiting for you"
+                  ? "Waiting for you to finish the check in Chrome"
                   : plainly(run.decision, run.observation)}
             </p>
           )}
+          {check && !showBrowser && <CheckNotice check={check} onContinue={onResumeCaptcha} />}
           {run.steps.length > 0 && (
             // Open while the agent works; folded to one line once it is done.
             <details className="steps" open={running ? true : undefined}>
@@ -69,16 +75,8 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
               </ol>
             </details>
           )}
-          {run.captcha && run.status === "paused" && (
-            <div className="notice" role="alert">
-              <strong>The site asked to check that you are human.</strong> {run.captcha.reason} Solve it in the browser
-              window, then continue.
-              <div>
-                <button type="button" className="ghost" onClick={onResumeCaptcha}>
-                  Continue
-                </button>
-              </div>
-            </div>
+          {run.checks.map((c) =>
+            c.outcome === "waiting" && c.waitS > 0 ? null : <CheckLine key={c.startedAt} check={c} />,
           )}
           {!running && (
             <p className={`verdict ${run.status === "done" ? "ok" : "bad"}`}>
@@ -94,6 +92,69 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
       </div>
     </>
   );
+}
+
+// "4:05": minutes and seconds left.
+const clock = (ms: number) => {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+};
+
+// "14 s", "2 min 5 s".
+const lasted = (ms: number) => {
+  const total = Math.max(1, Math.round(ms / 1000));
+  return total < 60 ? `${total} s` : `${Math.floor(total / 60)} min${total % 60 ? ` ${total % 60} s` : ""}`;
+};
+
+// The person's turn. The check lives in the Chrome window, not in this page:
+// the live view only shows it. The run notices by itself when the check is
+// done; Continue is for when it does not.
+function CheckNotice({ check, onContinue, overlay }: { check: HumanCheck; onContinue: () => void; overlay?: boolean }) {
+  const host = hostOf(check.url) || "The site";
+  const left = check.startedAt + check.waitS * 1000 - Date.now();
+  return (
+    <div className={`notice check-notice ${overlay ? "overlay" : ""}`} role="alert">
+      <strong>Your turn: {host} wants to check that you are human.</strong>
+      <p>Complete the check in the Chrome window. The run continues automatically once it is done.</p>
+      <div className="check-actions">
+        <button
+          type="button"
+          className="ghost"
+          onClick={onContinue}
+          title="Use this if you finished the check and the run did not carry on by itself."
+        >
+          Continue now
+        </button>
+        <span className="check-meta">
+          {overlay ? "This view only shows the tab; it does not take clicks. " : ""}
+          {left > 0 ? `Stops in ${clock(left)} if the check is not done.` : "Stopping…"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// A check that is over, in one line, kept in the turn's record.
+function CheckLine({ check }: { check: HumanCheck }) {
+  const host = hostOf(check.url) || "the site";
+  const took = lasted((check.endedAt ?? Date.now()) - check.startedAt);
+  let text: string;
+  let tone = "";
+  if (check.outcome === "completed") {
+    text = `You finished ${host}'s human check. Continued after ${took}.`;
+    tone = "ok";
+  } else if (check.outcome === "continued") {
+    text = `You pressed Continue at ${host}'s human check after ${took}.`;
+  } else if (check.waitS === 0) {
+    text = `${host} asked for a human check, and this browser has no window to do it in.`;
+    tone = "bad";
+  } else if (check.note === "stopped by user") {
+    text = `Stopped by you during ${host}'s human check.`;
+  } else {
+    text = check.note || `The run ended during ${host}'s human check.`;
+    tone = "bad";
+  }
+  return <p className={`check-line ${tone}`}>{text}</p>;
 }
 
 function Results({ run }: { run: Run }) {

@@ -24,6 +24,21 @@ export type Step = {
   typed: string | null; // a fill action's text arrives in the keystroke event after it
 };
 
+// A site's human check (press and hold, "verify you are human") the run met,
+// and how it ended. The person does the check in the Chrome window; the run
+// notices by itself when the check is gone.
+export type HumanCheck = {
+  url: string; // the check page
+  reason: string;
+  waitS: number; // how long the run waits for the person; 0 = nobody can (no browser window)
+  startedAt: number; // server clock, ms
+  endedAt: number | null;
+  // waiting: the person's turn. completed: the run saw the check gone.
+  // continued: the person pressed Continue. stopped: the run ended first.
+  outcome: "waiting" | "completed" | "continued" | "stopped";
+  note: string; // the run's own words when it stopped
+};
+
 export type Run = {
   id: string;
   request: string;
@@ -42,7 +57,8 @@ export type Run = {
   steps: Step[];
   modelMs: number; // decision latency so far; the final budget replaces it
   budget: BudgetEvent | null; // the final totals, when the run sent them
-  captcha: CaptchaEvent | null;
+  captcha: CaptchaEvent | null; // the live pause, with its resume token
+  checks: HumanCheck[];
   events: StreamEvent[]; // everything, for the trace export
 };
 
@@ -63,8 +79,27 @@ export function newRun(id: string, request: string): Run {
     modelMs: 0,
     budget: null,
     captcha: null,
+    checks: [],
     events: [],
   };
+}
+
+// The check the person is being asked to do right now, if any.
+export function waitingCheck(run: Run): HumanCheck | null {
+  const last = run.checks[run.checks.length - 1];
+  return last && last.outcome === "waiting" && last.waitS > 0 ? last : null;
+}
+
+const at = (ts: string) => {
+  const parsed = Date.parse(ts);
+  return Number.isNaN(parsed) ? Date.now() : parsed;
+};
+
+// Close the open check, if any, with how it ended.
+function endCheck(checks: HumanCheck[], outcome: HumanCheck["outcome"], ts: string, note = ""): HumanCheck[] {
+  const last = checks[checks.length - 1];
+  if (!last || last.endedAt !== null) return checks;
+  return [...checks.slice(0, -1), { ...last, outcome, note, endedAt: at(ts) }];
 }
 
 export function isTerminal(run: Run): boolean {
@@ -108,20 +143,40 @@ export function reduce(run: Run, event: StreamEvent): Run {
     case "budget":
       if (event.steps > 0 || event.usd > 0 || event.model_ms > 0) next.budget = event; // skip the start heartbeat
       break;
-    case "captcha":
-      next.captcha = event;
+    case "captcha": {
+      const waitS = event.wait_s ?? 0;
+      next.captcha = waitS > 0 ? event : null; // a check nobody can do has no pause to resume
+      const check: HumanCheck = {
+        url: event.url || run.observation?.url || "",
+        reason: event.reason,
+        waitS,
+        startedAt: at(event.ts),
+        endedAt: null,
+        outcome: "waiting",
+        note: "",
+      };
+      next.checks = [...endCheck(run.checks, "stopped", event.ts), check];
       break;
+    }
     case "status":
       next.status = event.status;
       next.reason = event.reason;
       if (event.status !== "paused") next.captcha = null;
-      if (isTerminal(next)) next.endedAt = end();
+      if (event.status === "running") {
+        const how = event.reason === "continued by you" ? "continued" : "completed";
+        next.checks = endCheck(run.checks, how, event.ts);
+      }
+      if (isTerminal(next)) {
+        next.endedAt = end();
+        next.checks = endCheck(run.checks, "stopped", event.ts, event.reason);
+      }
       break;
     case "error":
       if (!event.recoverable) {
         next.status = "error";
         next.reason = event.message;
         next.endedAt = end();
+        next.checks = endCheck(run.checks, "stopped", event.ts, event.message);
       }
       break;
   }
