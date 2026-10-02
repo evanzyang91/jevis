@@ -177,13 +177,19 @@ async def build_plan(*, adapter: TextAdapter, goal: str, url: str | None = None)
     guard and the UI read it. The policy reads the ledger's per-step view
     instead (`planner/progress.py`).
     """
+    return parse_plan(await plan_text(adapter=adapter, goal=goal, url=url), goal=goal, url=url)
+
+
+async def plan_text(*, adapter: TextAdapter, goal: str, url: str | None = None) -> str:
+    """The planner's raw JSON answer, which `parse_plan` reads. Kept as text so
+    a plan that worked can be stored and parsed again on the next run."""
     context = {"goal": goal, "site": url or ""}
     result = await adapter.complete(
         system=PLAN_GOAL,
         user=json.dumps(context),
         json_object=True,
     )
-    return parse_plan(result.text, goal=goal, url=url)
+    return result.text
 
 
 async def suggest_url(*, adapter: TextAdapter, goal: str) -> str:

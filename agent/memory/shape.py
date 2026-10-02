@@ -34,3 +34,18 @@ def situation(url: str, previous: Action | None) -> tuple[str, str]:
     path = urlparse(url).path or "/"
     previous_shape = action_shape(previous) if previous is not None else "start"
     return path, previous_shape
+
+
+def path_pattern(url: str) -> str:
+    """The path with its item-specific parts as `*`, so every product page of
+    a site is one situation: "/en/ip/Great-Value-Large-12-Eggs/10052944" ->
+    "/en/ip/*/*", Amazon's "/Logitech-M185/dp/B004YAVF8I" -> "/*/dp/*"."""
+    from urllib.parse import urlparse
+
+    parts = []
+    for segment in (urlparse(url).path or "/").split("/"):
+        if not segment:
+            continue
+        specific = any(c.isdigit() for c in segment) or len(segment) > 24 or segment.count("-") >= 2
+        parts.append("*" if specific else segment.lower())
+    return "/" + "/".join(parts)

@@ -16,8 +16,9 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from agent.executor import Frame, PlaywrightExecutor, uses_relay
-from agent.memory import InMemoryPlaybook, PlaybookStore
-from agent.planner import build_plan, localise, suggest_url
+from agent.memory import InMemoryPlaybook, PlaybookStore, Recall
+from agent.planner import localise, parse_plan, suggest_url
+from agent.planner.plan import plan_text
 from agent.providers import JevClient, adapter_for
 from agent.providers.registry import get
 from agent.supervisor import Supervisor
@@ -67,9 +68,10 @@ class Run:
 
 
 class RunManager:
-    def __init__(self, *, playbook: PlaybookStore | None = None) -> None:
+    def __init__(self, *, playbook: PlaybookStore | None = None, recall: Recall | None = None) -> None:
         self._runs: dict[UUID, Run] = {}
         self.playbook: PlaybookStore = playbook or InMemoryPlaybook()
+        self.recall: Recall = recall or Recall.default()
 
     def get(self, run_id: UUID) -> Run:
         run = self._runs.get(run_id)
@@ -175,6 +177,13 @@ class RunManager:
 
             text_adapter = adapter_for(text_model, text_info.provider)
 
+            # A plan an earlier run of this goal finished every step of: no
+            # site suggestion, no planner call (about six seconds).
+            given_url = run.start_url
+            remembered = self.recall.plan(run.goal, given_url)
+            raw_plan: str | None = remembered[0] if remembered else None
+            if remembered and not run.start_url and remembered[1]:
+                run.start_url = remembered[1]
             # If the user did not supply a URL, ask the text model to pick one
             # from the goal ("buy cake ingredients from Walmart" → walmart.com).
             # Then localise global retailers to the regional storefront (AGENT_REGION) so the
@@ -193,12 +202,16 @@ class RunManager:
             plan = None
             try:
                 log.debug("run %s: planning...", run.run_id)
-                plan = await build_plan(adapter=text_adapter, goal=run.goal, url=run.start_url)
+                from_memory = raw_plan is not None
+                if raw_plan is None:
+                    raw_plan = await plan_text(adapter=text_adapter, goal=run.goal, url=run.start_url)
+                plan = parse_plan(raw_plan, goal=run.goal, url=run.start_url)
                 log.debug("run %s: planned, %d steps, %d rules", run.run_id, len(plan.subgoals),
                           len(plan.constraints))
                 # The supervisor re-emits this event, with each step's status,
                 # whenever a step finishes, is skipped, or is rewritten.
-                run.bus.publish(plan_event(run.run_id, await run.bus.next_seq(), plan, note="planned"))
+                run.bus.publish(plan_event(run.run_id, await run.bus.next_seq(), plan,
+                                           note="planned from memory" if from_memory else "planned"))
             except Exception as err:  # noqa: BLE001
                 log.warning("run %s: planner failed (%s); continuing without a plan", run.run_id, err)
 
@@ -232,6 +245,8 @@ class RunManager:
                     goal=plan.refined_goal if plan is not None else run.goal,
                     run_id=run.run_id,
                     plan=plan,
+                    playbook=self.playbook,
+                    recall=self.recall,
                     # An attached Chrome (AGENT_CDP_URL) keeps its own windows,
                     # whatever AGENT_HEADLESS says; only a launched one can be windowless.
                     captcha_wait_s=captcha_wait_s(
@@ -241,6 +256,14 @@ class RunManager:
                 run.started = True
                 start_url = plan.start_url if plan is not None else run.start_url
                 run.state = await supervisor.run(start_url)
+                progress = run.state.progress
+                if plan is not None and raw_plan and progress is not None:
+                    # Keep a plan only once it finished every step; forget one
+                    # from memory that a run could not finish.
+                    if progress.done_count() == len(progress.steps):
+                        self.recall.keep_plan(run.goal, given_url, raw_plan, run.start_url)
+                    elif remembered:
+                        self.recall.drop_plan(run.goal, given_url)
                 # The run's totals, once, for the UI's results card: the
                 # heartbeat above is the only other budget event.
                 budget = run.state.budget

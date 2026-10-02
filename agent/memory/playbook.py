@@ -12,7 +12,11 @@ supervisor swap either without new plumbing.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlparse
 
@@ -20,6 +24,8 @@ from agent.executor import Action
 from agent.perception import Observation
 
 from .shape import action_shape, situation
+
+log = logging.getLogger("agent.memory.playbook")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +169,52 @@ class InMemoryPlaybook:
 
     async def forget(self, entry_id: int) -> None:
         self._rows = [row for row in self._rows if row["id"] != entry_id]
+
+
+class FilePlaybook(InMemoryPlaybook):
+    """The in-memory store, kept in a JSON file so what one run learned is
+    there for the next after a server restart. The default without Postgres."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self._path = path
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+            self._rows = [row for row in rows if isinstance(row, dict) and "next" in row]
+        except (OSError, ValueError):
+            self._rows = []
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            spare = self._path.with_suffix(".tmp")
+            spare.write_text(json.dumps(self._rows), encoding="utf-8")
+            os.replace(spare, self._path)
+        except OSError as err:
+            log.warning("playbook not saved to %s (%s)", self._path, err)
+
+    async def record(self, host: str, path: str, previous: str, next_shape: str) -> None:
+        await super().record(host, path, previous, next_shape)
+        self._renumber()
+        self._save()
+
+    async def confirm(self, host: str, path: str, previous: str, next_shape: str, success: bool) -> None:
+        await super().confirm(host, path, previous, next_shape, success)
+        self._save()
+
+    async def forget(self, entry_id: int) -> None:
+        await super().forget(entry_id)
+        self._save()
+
+    def _renumber(self) -> None:
+        """Ids stay unique after a forget (the base class numbers by count)."""
+        seen: set[int] = set()
+        top = max((row["id"] for row in self._rows), default=0)
+        for row in self._rows:
+            if row["id"] in seen:
+                top += 1
+                row["id"] = top
+            seen.add(row["id"])
 
 
 def _host_from(url: str) -> str:

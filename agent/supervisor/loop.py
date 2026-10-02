@@ -14,6 +14,8 @@ run ends as soon as every step is done or skipped.
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass, field, replace
@@ -22,13 +24,15 @@ from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from agent.executor import Action, Executor, Occluded, Outcome, StalePage
+from agent.memory import PlaybookStore, Recall, action_shape, path_pattern
 from agent.perception import CaptchaSignal, Observation, detect_captcha, observe
 from agent.perception.captcha import intended_url, title_signal, url_signal
 from agent.perception.captcha import probe as probe_page
 from agent.planner import MAX_REPAIRS, Change, Plan, Progress, cart_count, is_committing, repair, verify
-from agent.planner.progress import DONE, searched_for
+from agent.planner.progress import DONE, SKIPPED, product_of, searched_for
 from agent.policy import Decision, NoFieldValue, decide, field_value, should_escalate
-from agent.policy.jev_policy import in_cart_products, item_for
+from agent.policy.action_space import build, is_banned
+from agent.policy.jev_policy import commits_product, in_cart_products, item_for, policy_bans
 from agent.policy.reinstruct import HINT_STEPS, Hint, evidence_present, reinstruct
 from agent.providers import JevClient, TextAdapter
 from agent.transport import (
@@ -63,6 +67,8 @@ from .guards import (
 )
 
 RunStatus = str  # "running" | "done" | "blocked" | "error"
+
+log = logging.getLogger("agent.supervisor.loop")
 
 # A step whose DONE the verifier rejected this many times is accepted on the
 # next claim: the verifier reads page text only and can be wrong, and before
@@ -158,6 +164,16 @@ class RunState:
     pending_outcome: int | None = None
     # The last URL a "page" step was checked on arrival (see `_check_arrival`).
     arrival_checked: str = ""
+    # Memory (see `_recall`): the last executed move, until the next read says
+    # whether it changed the page: (host, path, situation, shape, recalled).
+    pending_move: tuple[str, str, str, str, bool] | None = None
+    # Moves that changed the page while the active step was open; credited
+    # in the playbook when that step finishes.
+    step_moves: list[tuple[str, str, str, str]] = field(default_factory=list)
+    # Situations where a recalled move did nothing this run: not recalled again.
+    recall_failed: set[str] = field(default_factory=set)
+    # Step index -> (site, term, product) of a product add credited this run.
+    added: dict[int, tuple[str, str, str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -186,6 +202,10 @@ class Supervisor:
     captcha_wait_s: float = 300.0
     # How often a waiting run looks at the page to see if the check is gone.
     captcha_poll_s: float = 1.5
+    # Cross-run memory. The playbook holds moves between pages, `recall` the
+    # product each search term finished with. None: every move asks the model.
+    playbook: PlaybookStore | None = None
+    recall: Recall | None = None
 
     async def run(self, start_url: str) -> RunState:
         state = RunState(run_id=self.run_id, goal=self.goal, resume_url=start_url)
@@ -254,7 +274,9 @@ class Supervisor:
                     done_reason = self._with_progress(
                         state, "url cycling: last dozen navigations only revisited 2-3 pages")
                     break
-                decision = await self._decide(state, observation)
+                decision = await self._recall(state, observation)
+                if decision is None:
+                    decision = await self._decide(state, observation)
                 if decision.operation == "DONE" and state.progress is not None:
                     # DONE means "the current step is finished". Confirm it
                     # (cheap text-model read of the page) before moving on; a
@@ -391,6 +413,131 @@ class Supervisor:
         if changes:
             await self._publish_progress(state, "; ".join(
                 f"step {change.index + 1} {change.status}: {change.note}" for change in changes))
+            await self._remember(state, changes)
+
+    # ---- Memory --------------------------------------------------------------
+
+    async def _remember(self, state: RunState, changes: list[Change]) -> None:
+        """Credit what finished steps: the moves taken while the step was open
+        (the playbook trusts a move once it led to a finished step), and the
+        product an add step finished with. A step skipped or rewritten
+        credits nothing; an add the cart did not confirm counts against its
+        product."""
+        progress = state.progress
+        if progress is None:
+            return
+        host = _host(state.observation.url if state.observation is not None else "")
+        for change in changes:
+            step = progress.steps[change.index]
+            if change.status == DONE:
+                moves, state.step_moves = state.step_moves, []
+                if self.playbook is not None:
+                    for move in moves:
+                        try:
+                            await self.playbook.confirm(*move, success=True)
+                        except Exception as err:  # noqa: BLE001 — memory never stops a run
+                            log.warning("playbook confirm failed: %s", err)
+                if self.recall is not None and step.step.done_when == "add" and step.product and step.term:
+                    self.recall.keep_product(host, step.term, step.product)
+                    state.added[change.index] = (host, step.term, step.product)
+            elif change.status == SKIPPED or change.note.startswith("rewritten"):
+                state.step_moves = []
+            elif change.index in state.added and self.recall is not None:
+                site, term, product = state.added.pop(change.index)
+                self.recall.keep_product(site, term, product, landed=False)
+
+    async def _learn_move(self, state: RunState, entry: HistoryEntry) -> None:
+        """The last move, now that the read says whether it changed the page."""
+        pending, state.pending_move = state.pending_move, None
+        if pending is None or self.playbook is None:
+            return
+        host, path, situation, shape, recalled = pending
+        try:
+            if entry.page_changed or entry.url_changed:
+                await self.playbook.record(host, path, situation, shape)
+                state.step_moves.append((host, path, situation, shape))
+            else:
+                await self.playbook.confirm(host, path, situation, shape, success=False)
+                if recalled:
+                    state.recall_failed.add(f"{host}|{path}|{situation}")
+        except Exception as err:  # noqa: BLE001 — memory never stops a run
+            log.warning("playbook record failed: %s", err)
+
+    async def _recall(self, state: RunState, observation: Observation) -> Decision | None:
+        """A move from memory instead of a model decision, when memory is sure:
+        - the product an earlier run's search for this step's term finished
+          with, when the page offers its add control;
+        - else the move that followed this situation on this site before and
+          led to finished steps, when exactly one offered control matches it.
+        Adds are only ever recalled by exact product; a hint (the run was
+        stuck) or a doubtful match leaves the decision to the model."""
+        progress = state.progress
+        active = progress.active if progress is not None else None
+        if active is None or state.hint is not None or (self.playbook is None and self.recall is None):
+            return None
+        goal = self._policy_goal(state)
+        history = self._history_for_policy(state)
+        space = build(observation)
+        banned = combined_ban(state.history, observation.marker, covered=state.covered)
+        banned = _search_left_open(state, observation, banned | policy_bans(observation, goal, history, space))
+        host = _host(observation.url)
+        pick = None
+        if self.recall is not None and active.step.done_when == "add" and active.term:
+            product = self.recall.product(host, active.term)
+            if product:
+                wanted = _plain_name(product)
+                for operation in space.operations:
+                    if operation.id != "CLICK":
+                        continue
+                    pick = next(((operation.id, target) for target in operation.targets
+                                 if commits_product(target.label) and not is_banned(operation.id, target, banned)
+                                 and _plain_name(product_of(target.label)) == wanted), None)
+        situation = _situation(state, observation)
+        if pick is None and self.playbook is not None and situation is not None \
+                and f"{host}|{situation[0]}|{situation[1]}" not in state.recall_failed:
+            try:
+                entries = await self.playbook.recall(host, *situation)
+            except Exception as err:  # noqa: BLE001 — memory never stops a run
+                log.warning("playbook recall failed: %s", err)
+                entries = []
+            for entry in entries:
+                if entry.succeeded < 1:
+                    continue
+                matches = [(operation.id, target) for operation in space.operations
+                           if operation.id in {"CLICK", "TYPE_TEXT", "SELECT"}
+                           for target in operation.targets
+                           if action_shape(target.action) == entry.next
+                           and not is_banned(operation.id, target, banned) and not commits_product(target.label)]
+                if len(matches) != 1:
+                    continue
+                operation_id, target = matches[0]
+                if operation_id == "TYPE_TEXT" and (
+                        not active.term
+                        or str(dict(target.hints).get("current_value", "")).strip().lower() == active.term.lower()):
+                    continue  # nothing to type, or it is typed already: the model decides what follows
+                pick = matches[0]
+                break
+        if pick is None:
+            return None
+        operation_id, target = pick
+        decision = Decision(
+            operation=operation_id, target=target.id, action=target.action, confidence=1.0,
+            probabilities={target.id: 1.0}, model="memory", latency_ms=0, usage={},
+            withheld=tuple(sorted(banned)),
+        )
+        await self._publish(DecisionEvent(
+            run_id=state.run_id,
+            seq=await self.bus.next_seq(),
+            operation=operation_id,
+            choice=target.id,
+            target=target.id,
+            probabilities={target.id: 1.0},
+            confidence=1.0,
+            model="memory",
+            remembered=True,
+            banned=sorted(banned),
+        ))
+        return decision
 
     async def _claim_done(self, state: RunState, observation: Observation) -> bool:
         """The policy said DONE while steps remain: finish the active step if
@@ -587,6 +734,7 @@ class Supervisor:
                 state.history[-1] = updated
         if pending_outcome is not None and state.history:
             last = state.history[-1]
+            await self._learn_move(state, last)
             await self._publish(OutcomeEvent(
                 run_id=state.run_id,
                 seq=await self.bus.next_seq(),
@@ -630,18 +778,7 @@ class Supervisor:
         banned = combined_ban(state.history, observation.marker, covered=state.covered) | set(ban)
         banned = _search_left_open(state, observation, banned)
         goal = self._policy_goal(state)
-        history_for_policy = [
-            {
-                "step": entry.step,
-                "operation": entry.operation,
-                "target": entry.target,
-                "label": entry.action_label,
-                "text": entry.text,
-                "page_changed": entry.page_changed,
-                "url_changed": entry.url_changed,
-            }
-            for entry in state.history
-        ]
+        history_for_policy = self._history_for_policy(state)
         # A hint lasts HINT_STEPS steps, and only while its evidence is on the page.
         if state.hint is not None and not (
             len(state.history) - state.hint_step < HINT_STEPS and evidence_present(state.hint, observation)
@@ -695,6 +832,21 @@ class Supervisor:
         ))
         return decision
 
+    @staticmethod
+    def _history_for_policy(state: RunState) -> list[dict[str, Any]]:
+        return [
+            {
+                "step": entry.step,
+                "operation": entry.operation,
+                "target": entry.target,
+                "label": entry.action_label,
+                "text": entry.text,
+                "page_changed": entry.page_changed,
+                "url_changed": entry.url_changed,
+            }
+            for entry in state.history
+        ]
+
     async def _ask_policy(self, state: RunState, observation: Observation, goal: str, history: list[dict],
                           banned: set[str], guidance: str | None, hint_control: str | None) -> Decision:
         """One policy decision, charged to the run's budget. Every call in a
@@ -727,6 +879,9 @@ class Supervisor:
     async def _act(self, state: RunState, observation: Observation, decision: Decision) -> None:
         action: Action = decision.action
         text: str | None = None
+        situation = _situation(state, observation)
+        host = _host(observation.url)
+        recalled = decision.model == "memory"
         # Emit the intent as soon as we know the decision. The UI's last-event
         # kind now reflects the actual stage even while the text helper runs
         # or the browser waits on navigation.
@@ -836,6 +991,8 @@ class Supervisor:
             ))
             await self._emit_error("executor", RuntimeError(
                 f"{'Target covered' if covered else 'Stale target'}: {str(err)[:200]}"))
+            if recalled and situation is not None:
+                state.recall_failed.add(f"{host}|{situation[0]}|{situation[1]}")
             return
         if reached_purchase(outcome.final_url, state.goal):
             # Hard stop, whatever the prompt said: leave the checkout page and
@@ -864,6 +1021,8 @@ class Supervisor:
         # navigation commits).
         state.untracked = (len(state.history) - 1, _item_context(observation))
         state.pending_outcome = outcome.load_ms
+        if situation is not None and action.kind in {"click", "fill", "select"}:
+            state.pending_move = (host, situation[0], situation[1], action_shape(action), recalled)
         state.budget.loaded(outcome.load_ms)
 
     def _bounds_for(self, observation: Observation, action: Action) -> tuple[float, float, float, float] | None:
@@ -1138,6 +1297,37 @@ class Supervisor:
             error_kind=type(err).__name__,
             message=str(err)[:400],
         ))
+
+
+_OPERATION_KIND = {"TYPE_TEXT": "fill", "CLICK": "click", "SELECT": "select", "SCROLL_UP": "scroll",
+                   "SCROLL_DOWN": "scroll", "BACK": "back", "ENTER": "enter", "WAIT": "wait"}
+
+
+def _situation(state: RunState, observation: Observation) -> tuple[str, str] | None:
+    """The playbook key of this moment: the page's path pattern, and the
+    active step's kind and phase (its term searched, typed, or not yet),
+    whether a dialog is open, and the shape of the last move. None without
+    an active step: a move means something only for what it was for."""
+    active = state.progress.active if state.progress is not None else None
+    if active is None:
+        return None
+    term = active.term
+    phase = "searched" if term and searched_for(observation.url, term) else ("typed" if active.typed else "fresh")
+    last = next((entry for entry in reversed(state.history) if entry.error is None), None)
+    previous = "start"
+    if last is not None:
+        previous = action_shape(Action(id="", kind=_OPERATION_KIND.get(last.operation, last.operation.lower()),
+                                       label=last.action_label))
+    dialog = "|dialog" if observation.scroll_area == "dialog" else ""
+    return path_pattern(observation.url), f"{active.step.done_when}:{phase}{dialog}|{previous}"
+
+
+def _host(url: str) -> str:
+    return (urlparse(url).hostname or "")[:200].lower()
+
+
+def _plain_name(name: str) -> str:
+    return re.sub(r"\s+", " ", name).strip().lower()
 
 
 def _search_left_open(state: RunState, observation: Observation, banned: set[str]) -> set[str]:

@@ -324,6 +324,31 @@ async def decide(
     return replace(decision, vetoed=refused[0], usage=usage, latency_ms=latency)
 
 
+def policy_bans(observation: Observation, goal: str, history: Iterable[Mapping[str, Any]],
+                space: ActionSpace | None = None) -> set[str]:
+    """The controls the policy never offers on this page, whatever it is asked:
+    the same set for a model decision and for a move recalled from memory."""
+    space = space or build(observation)
+    history = list(history)
+    banned = set(settled_options(observation, goal))
+    # Hide a product-title link whose "Add to cart - <item>" sibling is right
+    # beside it in the action space, so a commit intent cannot route through
+    # the product page. Nothing fires when no add control is offered.
+    banned |= _title_sibling_bans(space)
+    # Controls the prompt already forbids but a small model still took on
+    # unfamiliar pages: a favourites detour whose label names the item
+    # ("Sign in to add to Favourites list, Great Value Soya Sauce", chosen at
+    # 0.74), and a second product for an item already in the cart.
+    banned |= _detour_bans(observation, goal) | _duplicate_add_bans(space, goal, history, observation)
+    if not asks_several(goal):
+        banned |= {element.name for element in observation.elements
+                   if _QUANTITY_CONTROL.search(element.name or "")}
+    if not _REMOVE_GOAL.search(goal):
+        banned |= {element.name for element in observation.elements
+                   if _REMOVE_CONTROL.match(element.name or "")}
+    return banned
+
+
 async def _decide_once(
     *,
     client: JevClient,
@@ -335,22 +360,7 @@ async def _decide_once(
     hint_control: str | None = None,
 ) -> Decision:
     space = build(observation)
-    banned = {*banned, *settled_options(observation, goal)}
-    # Hide a product-title link whose "Add to cart - <item>" sibling is right
-    # beside it in the action space, so a commit intent cannot route through
-    # the product page. Nothing fires when no add control is offered.
-    banned = {*banned, *_title_sibling_bans(space)}
-    # Controls the prompt already forbids but a small model still took on
-    # unfamiliar pages: a favourites detour whose label names the item
-    # ("Sign in to add to Favourites list, Great Value Soya Sauce", chosen at
-    # 0.74), and a second product for an item already in the cart.
-    banned = {*banned, *_detour_bans(observation, goal), *_duplicate_add_bans(space, goal, history, observation)}
-    if not asks_several(goal):
-        banned = {*banned, *(element.name for element in observation.elements
-                             if _QUANTITY_CONTROL.search(element.name or ""))}
-    if not _REMOVE_GOAL.search(goal):
-        banned = {*banned, *(element.name for element in observation.elements
-                             if _REMOVE_CONTROL.match(element.name or ""))}
+    banned = {*banned, *policy_bans(observation, goal, history, space)}
     diagnosis = await diagnose_dialog(client=client, observation=observation, goal=goal)
     dialog = diagnosis[0] if diagnosis and diagnosis[1] >= DIALOG_KIND_MIN else None
     if dialog == "task" and not (hint_control and CLOSE_LABEL.match(hint_control)):

@@ -46,7 +46,16 @@ Set `DATABASE_URL` in `.env` to enable Postgres-backed playbooks:
 ```
 DATABASE_URL=postgres://agent:agent@127.0.0.1:5432/agent
 ```
-Without it, the server boots and uses an in-memory playbook that resets when the process stops.
+Without it, the server keeps the playbook in `~/.cache/agent/memory/playbook.json`.
+
+### Memory
+
+Runs learn from each other. A move between pages (type the search, press Search) is reused
+without asking the model once it has been seen twice on a site and led to a finished step; a
+product an add step finished with is added straight from the next search for the same term;
+and a goal whose plan finished every step skips the planner next time. Reused moves show as
+`remembered` in the decision trail. Files live in `~/.cache/agent/memory/` (`AGENT_MEMORY_DIR`
+moves them; `AGENT_MEMORY_DIR=off` turns memory off). Delete the folder to start fresh.
 
 ## Run
 
