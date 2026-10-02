@@ -191,7 +191,7 @@ def build(observation: Observation) -> ActionSpace:
         ))
     operations.append(Operation(id="ENTER", label="Press Enter on the focused element."))
     operations.append(Operation(id="WAIT", label="Wait for a running request or animation to settle."))
-    operations.append(Operation(id="DONE", label="Every requirement is visibly satisfied."))
+    operations.append(Operation(id="DONE", label="The current step is visibly finished."))
     operations.append(Operation(id="BLOCKED", label="No supported operation can advance the goal."))
     return ActionSpace(operations=tuple(operations))
 

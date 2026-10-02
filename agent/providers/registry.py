@@ -13,6 +13,7 @@ change every release.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -155,10 +156,30 @@ REGISTRY: dict[str, ModelInfo] = {
 }
 
 
+_SNAPSHOT = re.compile(r"^-(?:\d[\w.-]*|latest|preview[\w.-]*)$")
+
+
 def get(model_id: str) -> ModelInfo:
-    if model_id not in REGISTRY:
+    """The entry for an id, or for the name a provider answers with.
+
+    Providers name the model that served a call by its snapshot: OpenAI
+    answers "gpt-4.1-2025-04-14" for "gpt-4.1", TypeSafe "jev-1.13.0" for
+    "jev-latest". The budget prices calls by that name, so without this every
+    Jev call and every dated snapshot was counted at zero dollars."""
+    if model_id in REGISTRY:
+        return REGISTRY[model_id]
+    best: ModelInfo | None = None
+    best_len = 0
+    for info in REGISTRY.values():
+        for name in (info.id, info.api_model):
+            # The longest name wins: "gpt-4.1-mini-2025-04-14" is gpt-4.1-mini, not gpt-4.1.
+            if len(name) > best_len and model_id.startswith(name) and _SNAPSHOT.match(model_id[len(name):]):
+                best, best_len = info, len(name)
+    if best is None and model_id.startswith("jev-"):
+        best = next((info for info in REGISTRY.values() if info.provider == "typesafe"), None)
+    if best is None:
         raise KeyError(f"Unknown model id: {model_id!r}")
-    return REGISTRY[model_id]
+    return best
 
 
 def defaults() -> dict[Modality, str]:

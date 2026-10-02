@@ -17,7 +17,7 @@ from agent.executor import CLOSE_LABEL
 from agent.perception import Observation
 from agent.providers import JevClient, JevError, JevOversized
 
-from .action_space import ActionSpace, build, resolve, summarise
+from .action_space import ActionSpace, build, is_banned, resolve, summarise
 from .prompts import DIALOG_KIND, DIALOG_KINDS, NEXT_ACTION, STEP_CHECK, TARGET
 
 MAX_ACTION_SPACE = 60
@@ -29,6 +29,13 @@ DIALOG_KIND_MIN = 0.6
 CHECK_TRIGGER = 0.5
 CHECK_TERMINAL = 0.8
 CHECK_PASS = 0.7
+# A product's add control commits: a wrong product, or a second product for an
+# item already in the cart, cannot be undone by the next step. Unfamiliar
+# grocery runs added "Golden Sugar" for granulated sugar at 0.50 and a second
+# carton of eggs, both below this bar and above CHECK_TRIGGER. A failed check
+# here escalates at once (see should_escalate).
+COMMIT_TRIGGER = 0.8
+VETO_ROUNDS = 2
 CHECK_CANDIDATES = 3
 # Act on the check's best candidate when it clears and is not the policy's pick
 # ("open X" -> "Add to cart - X"). Only within the same operation's targets, or
@@ -77,16 +84,29 @@ def settled_options(observation: Observation, goal: str) -> set[str]:
             if e.checked or (e.group in finished and not goal_names(goal, e.name))}
 
 
-_COUNT = re.compile(r"\b(?:[2-9]|[1-9]\d+|two|three|four|five|six|seven|eight|nine|ten|dozen|several|"
+_COUNT = re.compile(r"\b(?:[2-9]|[1-9]\d+|two|three|four|five|six|seven|eight|nine|ten|several|"
                     r"pair|couple)\b", re.I)
+# Counts that do not ask for several units of one item: "for two" (people),
+# "all six" and "seven cake ingredients" (how many different items), and a
+# size ("2 L", "4 kg"). Planner goals end with "Stop when the cart shows all
+# seven cake ingredients", which used to offer every quantity control.
+_COUNT_OF_PEOPLE_OR_ITEMS = re.compile(r"\b(?:for|all|serves?|feeds?|of the|these|those)\s*$", re.I)
+_COUNT_THEN_NOT_UNITS = re.compile(
+    r"^\s*(?:(?:[a-z-]+\s+){0,2}(?:items?|ingredients?|things?|products?|people|persons?|guests?|servings?|"
+    r"kinds?|types?|categories|groceries|sides?|toppings?)\b|(?:kg|g|l|ml|lbs?|oz|%|litres?|liters?|pounds?|"
+    r"grams?|kilograms?|ounces?|pack|count|ct)\b|-)", re.I)
 
 
 def asks_several(goal: str) -> bool:
-    """Whether the goal asks for more than one of an item. A spelled-out count
-    in title case before another capitalised word is part of an item's name
-    ("Three Tacos"); a digit is always a count ("3 Coca-Cola cans")."""
+    """Whether the goal asks for more than one unit of an item. A spelled-out
+    count in title case before another capitalised word is part of an item's
+    name ("Three Tacos"); "for two", "all six items" and "2 L" are not
+    quantities; any other count is ("3 Coca-Cola cans", "two bags of flour")."""
     for match in _COUNT.finditer(goal):
-        if match.group()[0].isupper() and re.match(r"\s+[A-Z]", goal[match.end():]):
+        after = goal[match.end():]
+        if match.group()[0].isupper() and re.match(r"\s+[A-Z]", after):
+            continue
+        if _COUNT_OF_PEOPLE_OR_ITEMS.search(goal[:match.start()]) or _COUNT_THEN_NOT_UNITS.match(after):
             continue
         return True
     return False
@@ -185,6 +205,12 @@ class Decision:
     check_switch: str | None = None
     # True when the action above is the check's candidate, not the policy's pick.
     switched: bool = False
+    # True when the action adds a named product (see `commits_product`).
+    committing: bool = False
+    # The product add refused before this answer (see `decide`), if any.
+    vetoed: str | None = None
+    # Product adds this step's check scored hopeless (below CHECK_HOPELESS).
+    rejected: tuple[str, ...] = ()
 
 
 def _reduced(space: ActionSpace, keep: int) -> ActionSpace:
@@ -255,13 +281,55 @@ async def decide(
     hint_control: str | None = None,
 ) -> Decision:
     """Ask Jev for the next operation and target. Retries with a shrunken
-    action space when the server reports the request oversized."""
+    action space when the server reports the request oversized.
+
+    A product add whose step check is hopeless (below CHECK_HOPELESS, no
+    better candidate cleared) is not executed: the policy is asked again
+    without it and without every other add the same check found hopeless, at
+    most VETO_ROUNDS times. The check scored 0.01 for a mayonnaise dip as pasta
+    sauce and 0.23 for a second rice after rice was added, both picks a live
+    run made; a single refusal let the next pick be a rice side dish the check
+    had already scored 0.05. The answer then carries `vetoed`, which escalates
+    the step for a hint."""
+    ask = dict(client=client, observation=observation, goal=goal, history=history, guidance=guidance,
+               hint_control=hint_control)
+    decision = await _decide_once(banned=banned, **ask)
+    refused: list[str] = []
+    usage, latency = dict(decision.usage), decision.latency_ms
+    for _ in range(VETO_ROUNDS):
+        # Refused when the pick's own score is hopeless, even if another candidate scored higher.
+        if not (decision.committing and decision.check == "failed" and not decision.switched
+                and decision.action is not None and decision.action.label in decision.rejected):
+            break
+        refused += [decision.action.label, *(label for label in decision.rejected if label not in refused)]
+        decision = await _decide_once(banned={*banned, *refused}, **ask)
+        usage, latency = _usage_sum(usage, decision.usage), latency + decision.latency_ms
+    if not refused:
+        return decision
+    return replace(decision, vetoed=refused[0], usage=usage, latency_ms=latency)
+
+
+async def _decide_once(
+    *,
+    client: JevClient,
+    observation: Observation,
+    goal: str,
+    history: list[dict[str, Any]],
+    banned: Iterable[str] = (),
+    guidance: str | None = None,
+    hint_control: str | None = None,
+) -> Decision:
     space = build(observation)
     banned = {*banned, *settled_options(observation, goal)}
     # Hide a product-title link whose "Add to cart - <item>" sibling is right
     # beside it in the action space, so a commit intent cannot route through
     # the product page. Nothing fires when no add control is offered.
     banned = {*banned, *_title_sibling_bans(space)}
+    # Controls the prompt already forbids but a small model still took on
+    # unfamiliar pages: a favourites detour whose label names the item
+    # ("Sign in to add to Favourites list, Great Value Soya Sauce", chosen at
+    # 0.74), and a second product for an item already in the cart.
+    banned = {*banned, *_detour_bans(observation, goal), *_duplicate_add_bans(space, goal, history, observation)}
     if not asks_several(goal):
         banned = {*banned, *(element.name for element in observation.elements
                              if _QUANTITY_CONTROL.search(element.name or ""))}
@@ -350,7 +418,7 @@ async def decide(
             continue
         surviving = tuple(
             target.label for target in op.targets
-            if target.id not in banned_set and target.label not in banned_set
+            if not is_banned(op.id, target, banned_set)
         )
         if surviving:
             offered[op.id] = surviving
@@ -377,13 +445,16 @@ async def decide(
     check = None
     switched = False
     terminal = operation in {"DONE", "BLOCKED"}
+    committing = target is not None and commits_product(chosen_label)
+    rejected: tuple[str, ...] = ()
     if target is None and not terminal and signal < CHECK_TRIGGER:
         # Unsure between kinds of action (scroll, wait, back...): the check has
         # nothing concrete to judge. Each scroll of a loop looks reasonable alone
         # (0.69-0.73 in the 2026-10-01 replay), so it counts as failed, with no
         # call; the streak in should_escalate keeps a one-off WAIT from escalating.
         check = StepCheck(verdict="failed", best_p=0.0, switch=None, scores=(), usage={})
-    elif signal < CHECK_TRIGGER or (terminal and signal < CHECK_TERMINAL):
+    elif (signal < CHECK_TRIGGER or (terminal and signal < CHECK_TERMINAL)
+          or (committing and signal < COMMIT_TRIGGER)):
         pool = keyed if target is not None else executable
         shortlist = ([(chosen_key, chosen_label)]
                      + [(key, label) for key, label, _ in pool if key != chosen_key])[:CHECK_CANDIDATES]
@@ -394,6 +465,9 @@ async def decide(
         check = await check_step(client=client, goal=goal, page=state["page"],
                                  recent_actions=state["recent_actions"],
                                  candidates=[label for _, label in shortlist], screen=screen)
+        if check is not None:
+            rejected = tuple(label for (_, label), score in zip(shortlist, check.scores)
+                             if commits_product(label) and score < CHECK_HOPELESS)
         if CHECK_SWITCH and check is not None and check.switch_index:
             new_key = shortlist[check.switch_index][0]
             if target is not None:
@@ -439,6 +513,8 @@ async def decide(
         check_p=check.best_p if check else 0.0,
         check_switch=check.switch if check else None,
         switched=switched,
+        committing=action is not None and commits_product(action.label or ""),
+        rejected=rejected,
     )
 
 
@@ -450,6 +526,130 @@ def _item_of(label: str) -> str:
 def _routed(label: str) -> bool:
     """Whether a label is a committing route-prefixed control (`Add to cart - X`)."""
     return bool(_ROUTE_PREFIX.match(label.strip()))
+
+
+def commits_product(label: str) -> bool:
+    """Whether a control adds a named product: "Add to cart - Great Value Flour",
+    not a dialog's own "Add to cart - CA$15.60", whose item the dialog shows."""
+    return _routed(label) and bool(re.search(r"[a-z]{2}", _item_of(label)))
+
+
+# Controls that leave a shopping task for an account: sign-in, a favourites or
+# wish list. Withheld unless the goal itself is about an account or a list.
+_DETOUR = re.compile(r"^(?:sign in|log ?in|create (?:an )?account)\b|\b(?:add|save) to (?:my )?"
+                     r"(?:favou?rites|wish ?list|registry)\b", re.I)
+_ACCOUNT_GOAL = re.compile(r"sign in|log ?in|account|favou?rite|wish ?list|registry", re.I)
+# Site chrome no goal step needs: a stuck pasta run clicked "Language English"
+# (a language switch), "Legal" and "Claim offer now" while its search results
+# sat below the fold. Withheld unless the goal names them.
+_SITE_CHROME = re.compile(r"^(?:language|legal|claim offer|privacy|terms of|accessibility|careers|feedback)\b",
+                          re.I)
+
+
+def _detour_bans(observation: Observation, goal: str) -> set[str]:
+    account = bool(_ACCOUNT_GOAL.search(goal))
+    banned: set[str] = set()
+    for element in observation.elements:
+        name = element.name or ""
+        if (not account and _DETOUR.search(name)) or (
+                (match := _SITE_CHROME.match(name)) and match.group().lower() not in goal.lower()):
+            banned.add(name)
+    return banned
+
+
+# The planner writes one "Search '<term>'" per item. A product's add control
+# belongs to the most specific term whose words it holds ("Great Value Frozen
+# Mixed Vegetables" -> 'mixed vegetables'; "Green Onion, Sold in bunches" ->
+# 'green onions'). Goals without quoted terms get no item bookkeeping here.
+_QUOTED_TERM = re.compile(r"\bsearch (?:for )?['\"‘“]([^'\"’”]{2,60})['\"’”]", re.I)
+
+
+def goal_items(goal: str) -> list[str]:
+    seen: list[str] = []
+    for match in _QUOTED_TERM.finditer(goal):
+        term = match.group(1).strip().lower()
+        if term and term not in seen:
+            seen.append(term)
+    return seen
+
+
+def _words(text: str) -> set[str]:
+    """Lower-case words, plural 's' dropped, so "eggs" holds "egg"."""
+    return {w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+            for w in re.findall(r"[a-z0-9]+", text.lower())}
+
+
+def item_for(label: str, items: list[str]) -> str | None:
+    """The goal item a product's add control serves, or None."""
+    product = _words(_item_of(label))
+    fits = [item for item in items if _words(item) and _words(item) <= product]
+    return max(fits, key=lambda item: len(_words(item)), default=None)
+
+
+# A product already in the cart shows a quantity stepper instead of its add
+# control: "Decrease quantity Great Value Spaghetti Pasta, Current Quantity 1".
+_IN_CART = re.compile(r"^(?:decrease|increase|remove|update) quantity (?:of )?(.+?),\s*current quantity [1-9]", re.I)
+
+
+def in_cart_products(observation: Observation | None) -> set[str]:
+    """Products the page shows already in the cart."""
+    if observation is None:
+        return set()
+    return {match.group(1).strip() for element in observation.elements
+            if (match := _IN_CART.match(element.name or ""))}
+
+
+def finished_items(goal: str, history: Iterable[Mapping[str, Any]],
+                   observation: Observation | None = None) -> set[str]:
+    """Goal items whose product the history shows added (an add that changed
+    the page), or the page shows already in the cart. A cart that held
+    spaghetti before the run showed its stepper on the results, and the policy
+    added a second spaghetti (its check cleared 0.90: the history had no add)."""
+    items = goal_items(goal)
+    done: set[str] = set()
+    for entry in history:
+        label = str(entry.get("label") or "")
+        if entry.get("operation") == "CLICK" and entry.get("page_changed") and commits_product(label):
+            item = item_for(label, items)
+            if item is not None:
+                done.add(item)
+    for product in in_cart_products(observation):
+        item = item_for(f"Add to cart - {product}", items)
+        if item is not None:
+            done.add(item)
+    return done
+
+
+def _duplicate_add_bans(space: ActionSpace, goal: str, history: Iterable[Mapping[str, Any]],
+                        observation: Observation | None = None) -> set[str]:
+    """Add controls for an item already added or already in the cart. One cake
+    run put three cartons of eggs in the cart; NEXT_ACTION forbade it in words.
+    A goal that wants several of an item raises the quantity on the product
+    already added.
+
+    On the results of the last search, when that search was for an item now
+    finished, every add that serves no unfinished item is withheld too: with
+    spaghetti in the cart, the policy added "DeCecco High Protein Pasta" from
+    the spaghetti results, a product whose name holds no item's words."""
+    done = finished_items(goal, history, observation)
+    if not done:
+        return set()
+    items = goal_items(goal)
+    queries = [str(entry.get("text")) for entry in history
+               if entry.get("operation") == "TYPE_TEXT" and entry.get("text")]
+    searched = item_for(f"Add to cart - {queries[-1]}", items) if queries else None
+    on_finished_results = searched in done
+    banned: set[str] = set()
+    for operation in space.operations:
+        if operation.id != "CLICK":
+            continue
+        for target in operation.targets:
+            if not commits_product(target.label):
+                continue
+            item = item_for(target.label, items)
+            if item in done or (on_finished_results and item is None):
+                banned.add(target.label)
+    return banned
 
 
 def _title_sibling_bans(space: ActionSpace) -> set[str]:
@@ -489,7 +689,7 @@ def _offered_control(space: ActionSpace, banned: set[str], name: str) -> tuple[s
     """(operation, target id, label) of the offered target that `name` names."""
     for operation in space.operations:
         for candidate in operation.targets:
-            if candidate.id in banned or candidate.label in banned:
+            if is_banned(operation.id, candidate, banned):
                 continue
             if _same_control(candidate.label, name):
                 return operation.id, candidate.id, candidate.label
@@ -579,12 +779,17 @@ CHECK_HOPELESS = 0.45
 def should_escalate(decision: Decision, previous_check_failed: bool) -> bool:
     """Escalate a failed check when it is not a one-off: the previous step
     failed too, this step ends the run (DONE, BLOCKED, which leaves no next step
-    to wait for), or the check itself is hopeless (even the best candidate
-    scored below `CHECK_HOPELESS`, so the streak-wait would spend another step
-    on a wrong commit). One-off mild doubts on good runs stay cheap."""
+    to wait for), this step adds a product (a wrong add sticks), or the check
+    itself is hopeless (even the best candidate scored below `CHECK_HOPELESS`,
+    so the streak-wait would spend another step on a wrong commit). A refused
+    add (`vetoed`) escalates too: the policy wanted a product the check says
+    is wrong, so it needs a hint more than another guess. One-off mild doubts
+    on good runs stay cheap."""
+    if decision.vetoed:
+        return True
     if decision.check != "failed":
         return False
-    if decision.check_p < CHECK_HOPELESS:
+    if decision.check_p < CHECK_HOPELESS or decision.committing:
         return True
     return previous_check_failed or decision.operation in {"DONE", "BLOCKED"}
 
@@ -714,8 +919,10 @@ class CheckTestFailure(AssertionError):
     """An inline step-check test saw the wrong result."""
 
 
+# The third control was a favourites detour; `_detour_bans` now withholds those,
+# so the wrong pick here is another product of a different kind.
 _SUGAR = ("Rogers Fine Granulated Sugar 4kg", "Add to cart - Rogers Fine Granulated Sugar 4kg",
-          "Sign in to add to Favourites list, Rogers Fine Granulated Sugar 4kg")
+          "Add to cart - Rogers Golden Yellow Sugar 2kg")
 
 
 def _sugar_page() -> Observation:
@@ -776,7 +983,7 @@ class _OpJev(_SplitJev):
 
 
 class _HintJev(_SplitJev):
-    """Policy unsure between three sugar controls (picks the favourites one); the
+    """Policy unsure between the sugar controls (picks the golden sugar); the
     check scores every candidate low except "Add to cart"."""
 
     async def ask(self, *, state: dict[str, Any], questions: dict[str, Any]):  # noqa: ANN201
@@ -847,9 +1054,9 @@ async def _option_unit_tests() -> None:
         raise CheckTestFailure("a hint naming the close control could not close")
     # Hint control: the policy ignores the hint and fails its check; the named control is taken.
     # `_title_sibling_bans` hides the plain "Rogers Fine Granulated Sugar 4kg" title because its
-    # "Add to cart - …" sibling is also offered. Only the add and the favourites detour reach the
-    # model. Target_probs are now ordered to the surviving ids: add first, favourites second —
-    # keep the fav at 0.45 so its signal stays below CHECK_TRIGGER and the check runs.
+    # "Add to cart - …" sibling is also offered. Only the two adds reach the model. Target_probs
+    # are ordered to the surviving ids: granulated first, golden second — keep golden at 0.45 so
+    # its signal stays below CHECK_TRIGGER and the check runs.
     jev = _HintJev(0.9, [0.10, 0.45], [])
     decision = await decide(client=jev, observation=_sugar_page(), goal="Add one bag of sugar to the cart.",
                             history=[], guidance="Click Add to cart.", hint_control=_SUGAR[1])  # type: ignore[arg-type]
@@ -859,22 +1066,22 @@ async def _option_unit_tests() -> None:
 
 async def _check_unit_tests() -> None:
     goal = "Search 'granulated sugar' and add one bag to the cart. Do not place the order."
-    # Gap 1: one item's routes count as one decision; a favourites detour does not.
+    # Gap 1: one item's routes count as one decision; another product does not.
     signal = grouped_signal(0.9, _SUGAR[0], [(_SUGAR[0], 0.40), (_SUGAR[1], 0.35), (_SUGAR[2], 0.25)])
     if abs(signal - 0.75) > 1e-9:
         raise CheckTestFailure(f"routes not grouped: {signal}")
     if grouped_signal(0.9, _SUGAR[2], [(_SUGAR[0], 0.40), (_SUGAR[1], 0.35), (_SUGAR[2], 0.25)]) != 0.25:
-        raise CheckTestFailure("favourites detour was grouped with the item")
+        raise CheckTestFailure("another product was grouped with the item")
     # Gap 2: no check when the grouped signal is high. `_title_sibling_bans` hides the plain
-    # title because its "Add to cart - …" sibling is offered, so only [add, favourites] reach the
-    # model. With the add at 0.75 — above CHECK_TRIGGER — the check never runs.
-    jev = _SplitJev(0.9, [0.75, 0.15], [0.9, 0.9, 0.1])
+    # title because its "Add to cart - …" sibling is offered, so only the two adds reach the
+    # model. With the add at 0.85 — above CHECK_TRIGGER and COMMIT_TRIGGER — the check never runs.
+    jev = _SplitJev(0.9, [0.85, 0.15], [0.9, 0.9, 0.1])
     decision = await decide(client=jev, observation=_sugar_page(), goal=goal, history=[])  # type: ignore[arg-type]
     if jev.checks or decision.check is not None:
         raise CheckTestFailure("check ran on a confident decision")
-    # Gap 2: an unsure pick (the favourites detour at 0.45) is checked and logged; the
+    # Gap 2: an unsure pick (the golden sugar at 0.45) is checked and logged; the
     # better candidate — the add control — is named, and the action switches to it.
-    jev = _SplitJev(0.9, [0.10, 0.45], [0.10, 0.85, 0.90])  # pick first: add, favourites
+    jev = _SplitJev(0.9, [0.10, 0.45], [0.10, 0.85, 0.90])  # pick first: granulated, golden
     decision = await decide(client=jev, observation=_sugar_page(), goal=goal, history=[])  # type: ignore[arg-type]
     if jev.checks != 1 or decision.check != "cleared" or decision.check_switch != _SUGAR[1]:
         raise CheckTestFailure(f"check not logged: {decision.check} {decision.check_switch}")
@@ -898,9 +1105,12 @@ async def _check_unit_tests() -> None:
         if asks_several(text) != several:
             raise CheckTestFailure(f"count detection wrong for {text!r}")
     # Gap 3: escalate on the second failure in a row, or at once for DONE/BLOCKED.
-    failed = replace(cleared, check="failed")
+    # `cleared` switched to an add; the streak rule is for steps that commit nothing.
+    failed = replace(cleared, check="failed", committing=False)
     if should_escalate(failed, previous_check_failed=False) or not should_escalate(failed, True):
         raise CheckTestFailure("streak rule wrong")
+    if not should_escalate(replace(failed, committing=True), previous_check_failed=False):
+        raise CheckTestFailure("failed add did not escalate at once")
     if not should_escalate(replace(failed, operation="DONE"), previous_check_failed=False):
         raise CheckTestFailure("failed DONE did not escalate at once")
     if should_escalate(cleared, previous_check_failed=True):
@@ -938,7 +1148,7 @@ async def _check_e2e_live() -> None:
                         {"label": "Burrito Bowl CA$15.60", "page_changed": True},
                         {"label": "Loading Add to cart - CA$15.60", "page_changed": False},
                         {"label": "Add item to cart", "page_changed": True}],
-        candidates=["DONE: Every requirement is visibly satisfied.",
+        candidates=["DONE: The current step is visibly finished.",
                     "SCROLL_DOWN: Reveal content below the viewport.",
                     "WAIT: Wait for a running request or animation to settle."])
     print(f"live: chipotle wrong DONE -> {done.verdict if done else None} best={done.best_p if done else 0:.2f}")

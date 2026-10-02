@@ -586,7 +586,7 @@ class Supervisor:
             # policy decides again with it. The policy still picks the action.
             pick = f"{decision.operation} {decision.action.label if decision.action else ''}".strip()
             hint = await reinstruct(adapter=self.text, goal=goal, observation=observation,
-                                    history=history_for_policy, policy_pick=pick)
+                                    history=history_for_policy, policy_pick=pick, banned=banned)
             if hint is not None:
                 state.budget.spent(hint.model, tokens_in=hint.usage["prompt_tokens"],
                                    tokens_out=hint.usage["completion_tokens"], latency_ms=hint.latency_ms)
@@ -887,7 +887,8 @@ class Supervisor:
             if not searched_for(observation.url, term):
                 return current_value or term
         history_for_helper: list[dict[str, Any]] = [
-            {"step": entry.step, "label": entry.action_label, "page_changed": entry.page_changed}
+            {"step": entry.step, "label": entry.action_label, "page_changed": entry.page_changed,
+             **({"text": entry.text} if entry.text else {})}
             for entry in state.history
         ]
         try:
@@ -899,6 +900,7 @@ class Supervisor:
                 current_value=current_value,
                 page_text=observation.text,
                 history=history_for_helper,
+                guidance=state.hint.guidance if state.hint is not None else None,
             )
         except NoFieldValue:
             raise StalePage("Text helper declined the field") from None
