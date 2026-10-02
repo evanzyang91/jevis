@@ -21,7 +21,8 @@ from agent.planner import build_plan, localise, suggest_url
 from agent.providers import JevClient, adapter_for
 from agent.providers.registry import get
 from agent.supervisor import Supervisor
-from agent.transport import BudgetEvent, Bus, ErrorEvent, FileLogger, FrameEvent, PlanEvent, StatusEvent
+from agent.supervisor.loop import plan_event
+from agent.transport import BudgetEvent, Bus, ErrorEvent, FileLogger, FrameEvent, StatusEvent
 
 if TYPE_CHECKING:
     from agent.transport import Subscription
@@ -175,16 +176,11 @@ class RunManager:
             try:
                 log.debug("run %s: planning...", run.run_id)
                 plan = await build_plan(adapter=text_adapter, goal=run.goal, url=run.start_url)
-                log.debug("run %s: planned, %d subgoals", run.run_id, len(plan.subgoals))
-                run.bus.publish(PlanEvent(
-                    run_id=run.run_id,
-                    seq=await run.bus.next_seq(),
-                    plan=[subgoal.text for subgoal in plan.subgoals],
-                    active_index=0,
-                    original_goal=plan.original_goal,
-                    refined_goal=plan.refined_goal,
-                    start_url=plan.start_url,
-                ))
+                log.debug("run %s: planned, %d steps, %d rules", run.run_id, len(plan.subgoals),
+                          len(plan.constraints))
+                # The supervisor re-emits this event, with each step's status,
+                # whenever a step finishes, is skipped, or is rewritten.
+                run.bus.publish(plan_event(run.run_id, await run.bus.next_seq(), plan, note="planned"))
             except Exception as err:  # noqa: BLE001
                 log.warning("run %s: planner failed (%s); continuing without a plan", run.run_id, err)
 

@@ -4,6 +4,11 @@ One `Supervisor` owns one run. It coordinates observation, decision, action,
 and outcome, and emits a typed event for each. Everything policy-adjacent
 (retries, guards, budgets, verification) lives on the supervisor — the layers
 below it stay stateless.
+
+With a plan, the supervisor also keeps the plan's ledger (`planner.Progress`):
+the policy works on one step at a time, each finished step is recorded once
+and never redone, a BLOCKED step is rewritten once and then skipped, and the
+run ends as soon as every step is done or skipped.
 """
 
 from __future__ import annotations
@@ -17,7 +22,8 @@ from uuid import UUID, uuid4
 
 from agent.executor import Action, Executor, Occluded, Outcome, StalePage
 from agent.perception import Observation, detect_captcha, observe
-from agent.planner import Plan
+from agent.planner import MAX_REPAIRS, Change, Plan, Progress, cart_count, is_committing, repair, verify
+from agent.planner.progress import DONE, searched_for
 from agent.policy import Decision, NoFieldValue, decide, field_value, should_escalate
 from agent.policy.reinstruct import HINT_STEPS, Hint, evidence_present, reinstruct
 from agent.providers import JevClient, TextAdapter
@@ -34,6 +40,7 @@ from agent.transport import (
     Keystroke,
     ObservationEvent,
     OutcomeEvent,
+    PlanEvent,
     StatusEvent,
 )
 from agent.transport.events import Point, Rect
@@ -51,45 +58,49 @@ from .guards import (
 
 RunStatus = str  # "running" | "done" | "blocked" | "error"
 
+# A step whose DONE the verifier rejected this many times is accepted on the
+# next claim: the verifier reads page text only and can be wrong, and before
+# the ledger every DONE was trusted outright.
+MAX_DONE_REJECTIONS = 2
+# Steps skipped in a row (no step finished in between) before the run itself
+# counts as blocked: the site, not the items, is the problem.
+MAX_SKIPS_IN_A_ROW = 3
+# Wait before re-reading the cart badge when the run's last add has not shown
+# on it yet.
+CART_SETTLE_S = 1.5
 
-def _next_search_term(plan: Plan, history: list["HistoryEntry"], current_value: str | None) -> str | None:
-    """The next unsatisfied search subgoal's term, or None when the fast path
-    cannot serve this fill.
 
-    Each committing Add in history (`Add to cart - X`, `Add to order - X`,
-    `Add item to cart - X`) is matched to the first unsatisfied subgoal whose
-    `search_term` is a substring of X. That way a duplicate add on an already-
-    satisfied subgoal (flour added twice) does not consume the next subgoal's
-    slot, and a run that added six items but silently skipped sugar keeps
-    returning "sugar" from the fast path until sugar is actually in the cart.
+def plan_event(run_id: UUID, seq: int, plan: Plan, progress: Progress | None = None, note: str = "") -> PlanEvent:
+    """The plan and its ledger as one event. Before the ledger exists (the
+    manager's first emission) the first step is active and the rest pending."""
+    if progress is not None:
+        steps: list[dict[str, Any]] = progress.snapshot()
+    else:
+        steps = [{"text": s.text, "status": "active" if i == plan.active_index else "pending",
+                  "search_term": s.search_term, "done_when": s.done_when} for i, s in enumerate(plan.subgoals)]
+    return PlanEvent(
+        run_id=run_id,
+        seq=seq,
+        plan=[s.text for s in plan.subgoals],
+        active_index=plan.active_index,
+        original_goal=plan.original_goal,
+        refined_goal=plan.refined_goal,
+        start_url=plan.start_url,
+        steps=steps,  # type: ignore[arg-type] — validated into PlanStep
+        constraints=list(plan.constraints),
+        stop_when=plan.stop_when or "",
+        note=note[:300],
+    )
 
-    Returning None hands the fill back to the text helper: every planned
-    subgoal is satisfied, or the field already holds the term we would type
-    (a retry — the previous search found nothing useful, so let the helper
-    pick something more specific).
-    """
-    search_subs = [s for s in plan.subgoals if s.search_term]
-    satisfied = [False] * len(search_subs)
-    for entry in history:
-        if entry.operation != "CLICK" or not entry.page_changed:
-            continue
-        label = (entry.action_label or "").lower()
-        if not label.startswith(("add to cart", "add to order", "add item to cart")):
-            continue
-        for i, subgoal in enumerate(search_subs):
-            if satisfied[i]:
-                continue
-            if subgoal.search_term.strip().lower() in label:
-                satisfied[i] = True
-                break
-    for i, subgoal in enumerate(search_subs):
-        if satisfied[i]:
-            continue
-        term = subgoal.search_term.strip()
-        if current_value and current_value.strip().lower() == term.lower():
-            return None
-        return term
-    return None
+
+def _item_context(observation: Observation) -> str:
+    """A name for the item an add acts on when its label names only a price
+    ("Add to cart - CA$15.60" in a DoorDash item dialog): the dialog's first
+    words, else the page title."""
+    if observation.scroll_area == "dialog" and observation.dialog_text:
+        head = observation.dialog_text.strip().split("\n", 1)[0]
+        return " ".join(head.split()[:6])
+    return observation.title or ""
 
 
 @dataclass(slots=True)
@@ -119,6 +130,15 @@ class RunState:
     # The text model's hint from the last escalation, and the step it was given at.
     hint: Hint | None = None
     hint_step: int = 0
+    # The plan's ledger; None for a run without a plan (tests, planner failure).
+    progress: Progress | None = None
+    # The last action's history index and item context, until the next
+    # observation (with its authoritative page_changed) feeds it to the ledger.
+    untracked: tuple[int, str] | None = None
+    # Label of the last page-changing click that was not an add, for one
+    # badge read: a badge rise right after it is an add the label did not show.
+    plain_click: str | None = None
+    skips_in_a_row: int = 0
 
 
 @dataclass(slots=True)
@@ -136,22 +156,28 @@ class Supervisor:
     goal: str
     run_id: UUID = field(default_factory=uuid4)
     state: RunState | None = None
-    # Optional. When present, the fill fast-path reads pre-generated search
-    # terms from the plan's subgoals instead of asking the text helper. None
-    # (test harness, no planner) keeps the old helper-every-fill behaviour.
+    # Optional. With a plan the supervisor tracks it step by step (see the
+    # module docstring), and the fill fast path types the active step's
+    # search term. None (test harness, no planner) keeps the whole-goal loop:
+    # DONE ends the run, BLOCKED ends it, every fill asks the text helper.
     plan: Plan | None = None
 
     async def run(self, start_url: str) -> RunState:
         state = RunState(run_id=self.run_id, goal=self.goal)
         self.state = state
+        if self.plan is not None and self.plan.subgoals:
+            state.progress = Progress(self.plan)
         await self._publish_status(state, "running")
+        if state.progress is not None:
+            await self._publish_progress(state, "tracking started")
         done_reason = ""
         try:
             await self.executor.navigate(start_url)
             while state.status == "running":
                 if state.budget.exhausted():
+                    await self._publish_changes(state, self._track(state, None))
                     state.status = "blocked"
-                    done_reason = "step budget exhausted"
+                    done_reason = self._with_progress(state, "step budget exhausted")
                     break
                 observation = await self._observe(state)
                 state.observation = observation
@@ -159,34 +185,64 @@ class Supervisor:
                 if signal is not None:
                     await self._pause_for_human(state, signal.reason)
                     continue
+                if state.progress is not None and state.progress.finished():
+                    if state.progress.awaiting_cart():
+                        # The last add is not on the cart badge yet: one more
+                        # read before ending, so an add that never landed reopens
+                        # its step instead of ending the run.
+                        await asyncio.sleep(CART_SETTLE_S)
+                        observation = await self._observe(state)
+                        state.observation = observation
+                    if state.progress.finished():
+                        state.status, done_reason = self._finish(state)
+                        break
                 if is_blocked_tail(state.history):
                     state.status = "blocked"
-                    done_reason = "no action changed the page over 4 steps"
+                    done_reason = self._with_progress(state, "no action changed the page over 4 steps")
                     break
                 if url_cycling(state.history):
                     state.status = "blocked"
-                    done_reason = "url cycling: last dozen navigations only revisited 2-3 pages"
+                    done_reason = self._with_progress(
+                        state, "url cycling: last dozen navigations only revisited 2-3 pages")
                     break
                 decision = await self._decide(state, observation)
+                if decision.operation == "DONE" and state.progress is not None:
+                    # DONE means "the current step is finished". Confirm it
+                    # (cheap text-model read of the page) before moving on; a
+                    # rejected claim is decided again without DONE, so the
+                    # policy cannot spin on it.
+                    if await self._claim_done(state, observation):
+                        if state.progress.finished():
+                            state.status, done_reason = self._finish(state)
+                            break
+                        continue
+                    decision = await self._decide(state, observation, ban={"DONE"})
                 if decision.operation == "DONE":
-                    # Trust the model. The verifier layer we tried on top of
-                    # this — an extra Jev call that rejected DONE and pushed
-                    # the model into a re-check loop — caused more failures
-                    # (cart-icon spam, invalid Jev responses) than it caught
-                    # premature-DONE bugs. Old jevis had no verifier and
-                    # worked, and the model's own prompt already carries the
-                    # rules for when DONE is legitimate.
+                    # No plan: trust the model. The verifier layer we tried on
+                    # top of this — an extra Jev call that rejected DONE and
+                    # pushed the model into a re-check loop — caused more
+                    # failures (cart-icon spam, invalid Jev responses) than it
+                    # caught premature-DONE bugs.
                     state.status = "done"
                     done_reason = "goal reported met"
                     break
                 if decision.operation == "BLOCKED":
+                    if state.progress is not None:
+                        # One impossible step must not end the run: rewrite it
+                        # once, else skip it and go on with the rest.
+                        keep_going = await self._step_blocked(state, observation)
+                        if state.progress.finished():
+                            state.status, done_reason = self._finish(state)
+                            break
+                        if keep_going:
+                            continue
                     state.status = "blocked"
                     text_hint = observation.text[:160].replace("\n", " ").strip()
-                    done_reason = (
+                    done_reason = self._with_progress(state, (
                         f"policy said no way forward on {observation.url} "
                         f"({len(observation.elements)} elements). "
                         f"Page text: {text_hint!r}"
-                    )
+                    ))
                     break
                 await self._act(state, observation, decision)
                 state.budget.stepped()
@@ -197,15 +253,138 @@ class Supervisor:
             # without emitting a terminal status, leaving the UI stuck on
             # "running" and the stop button looking dead.
             state.status = "blocked"
-            done_reason = "stopped by user"
+            done_reason = self._with_progress(state, "stopped by user")
             await self._publish_status(state, state.status, done_reason)
             raise
         except Exception as err:  # noqa: BLE001 — report and stop, do not swallow
             state.status = "error"
-            done_reason = str(err)[:200]
+            done_reason = self._with_progress(state, str(err)[:200])
             await self._emit_error("supervisor", err)
         await self._publish_status(state, state.status, done_reason)
         return state
+
+    # ---- Plan progress -------------------------------------------------------
+
+    def _policy_goal(self, state: RunState) -> str:
+        """The goal the policy, the text helper, and the hint writer read: the
+        ledger's one-step view with a plan, else the whole goal."""
+        return state.progress.goal_for_policy() if state.progress is not None else state.goal
+
+    @staticmethod
+    def _with_progress(state: RunState, reason: str) -> str:
+        if state.progress is None:
+            return reason
+        return f"{reason}. {state.progress.summary()}"
+
+    @staticmethod
+    def _finish(state: RunState) -> tuple[RunStatus, str]:
+        """Every step is done or skipped. Done if any step got done; skipped
+        steps are named in the reason."""
+        progress = state.progress
+        assert progress is not None
+        if progress.done_count() == 0:
+            return "blocked", f"no step could be done. {progress.summary()}"
+        return "done", progress.summary()
+
+    def _track(self, state: RunState, observation: Observation | None) -> list[Change]:
+        """Feed the ledger the last action (with the page_changed the reader
+        just confirmed) and the cart badge on this observation."""
+        progress = state.progress
+        if progress is None:
+            return []
+        changes: list[Change] = []
+        if state.untracked is not None:
+            index, context = state.untracked
+            state.untracked = None
+            entry = state.history[index] if index < len(state.history) else None
+            if entry is not None:
+                if entry.text and entry.operation == "TYPE_TEXT":
+                    progress.on_fill(entry.text)
+                if entry.operation == "CLICK" and entry.page_changed:
+                    if is_committing(entry.action_label):
+                        changes += progress.on_add(entry.action_label, fallback_name=context)
+                    else:
+                        state.plain_click = entry.action_label
+                if entry.url_changed and entry.url:
+                    changes += progress.on_navigate(entry.url)
+        if observation is not None:
+            count = cart_count([element.name for element in observation.elements])
+            changes += progress.on_cart(count, last_click=state.plain_click)
+            state.plain_click = None
+        if any(change.status == DONE for change in changes):
+            state.skips_in_a_row = 0
+        return changes
+
+    async def _publish_progress(self, state: RunState, note: str) -> None:
+        if state.progress is None:
+            return
+        await self._publish(plan_event(state.run_id, await self.bus.next_seq(), state.progress.plan,
+                                       state.progress, note))
+
+    async def _publish_changes(self, state: RunState, changes: list[Change]) -> None:
+        if changes:
+            await self._publish_progress(state, "; ".join(
+                f"step {change.index + 1} {change.status}: {change.note}" for change in changes))
+
+    async def _claim_done(self, state: RunState, observation: Observation) -> bool:
+        """The policy said DONE while steps remain: finish the active step if
+        the page confirms it. True when the step was finished."""
+        progress = state.progress
+        assert progress is not None
+        step = progress.active
+        if step is None:
+            return True
+        if step.rejected_done >= MAX_DONE_REJECTIONS:
+            await self._publish_changes(state, [progress.complete(step, "policy said done (unconfirmed)")])
+            state.skips_in_a_row = 0
+            return True
+        page = "\n".join(part for part in (observation.dialog_text, observation.text) if part)
+        try:
+            result = await verify(adapter=self.text, subgoal_text=step.step.text, check=step.step.check,
+                                  page_text=page, url=observation.url)
+        except Exception as err:  # noqa: BLE001 — verifier down: trust the policy, as before the ledger
+            await self._emit_error("planner", err)
+            await self._publish_changes(state, [progress.complete(step, "policy said done (verifier failed)")])
+            state.skips_in_a_row = 0
+            return True
+        state.budget.spent(result.model, tokens_in=result.usage["prompt_tokens"],
+                           tokens_out=result.usage["completion_tokens"], latency_ms=result.latency_ms)
+        if result.met:
+            await self._publish_changes(state, [progress.complete(step, f"confirmed: {result.reason}")])
+            state.skips_in_a_row = 0
+            return True
+        step.rejected_done += 1
+        await self._publish_progress(state, f"step {step.index + 1} not finished yet: {result.reason}")
+        return False
+
+    async def _step_blocked(self, state: RunState, observation: Observation) -> bool:
+        """The policy said BLOCKED on the active step. Rewrite the step once
+        (a broader search, the closest equivalent), else skip it. True when the
+        run goes on; False when steps keep blocking and the run should end."""
+        progress = state.progress
+        assert progress is not None
+        step = progress.active
+        if step is None:
+            return False
+        reason = f"no way forward on {observation.url}"
+        if step.repairs < MAX_REPAIRS:
+            fix = None
+            try:
+                fix = await repair(adapter=self.text, goal=progress.plan.original_goal,
+                                   rules=progress.plan.constraints, step=step.step, reason=reason,
+                                   url=observation.url, page_text=observation.text)
+                state.budget.spent(fix.model, tokens_in=fix.usage["prompt_tokens"],
+                                   tokens_out=fix.usage["completion_tokens"], latency_ms=fix.latency_ms)
+            except Exception as err:  # noqa: BLE001 — no repair: skip the step below
+                await self._emit_error("planner", err)
+            if fix is not None and fix.step is not None:
+                await self._publish_changes(state, [progress.rewrite(step, fix.step)])
+                return True
+            if fix is not None:
+                reason = fix.reason
+        await self._publish_changes(state, [progress.skip(step, reason)])
+        state.skips_in_a_row += 1
+        return state.skips_in_a_row < MAX_SKIPS_IN_A_ROW
 
     async def _publish_status(self, state: RunState, status: str, reason: str = "") -> None:
         await self._publish(StatusEvent(
@@ -245,6 +424,9 @@ class Supervisor:
             actual_change = last.marker != observation.marker
             if last.page_changed and not actual_change:
                 state.history[-1] = replace(last, page_changed=False)
+        # The ledger reads the corrected page_changed: an add the page ignored
+        # finishes nothing.
+        await self._publish_changes(state, self._track(state, observation))
         state.budget.loaded(0)
         await self._publish(ObservationEvent(
             run_id=state.run_id,
@@ -269,8 +451,12 @@ class Supervisor:
         ))
         return observation
 
-    async def _decide(self, state: RunState, observation: Observation) -> Decision:
-        banned = combined_ban(state.history, observation.marker, covered=state.covered)
+    async def _decide(self, state: RunState, observation: Observation, ban: frozenset[str] | set[str] = frozenset(),
+                      ) -> Decision:
+        """One policy decision on this observation. `ban` adds operations or
+        labels to hide for this decision only (DONE after a rejected claim)."""
+        banned = combined_ban(state.history, observation.marker, covered=state.covered) | set(ban)
+        goal = self._policy_goal(state)
         history_for_policy = [
             {
                 "step": entry.step,
@@ -290,25 +476,26 @@ class Supervisor:
             state.hint = None
         guidance = state.hint.guidance if state.hint is not None else None
         hint_control = state.hint.control if state.hint is not None else None
-        decision = await self._ask_policy(state, observation, history_for_policy, banned, guidance, hint_control)
+        decision = await self._ask_policy(state, observation, goal, history_for_policy, banned, guidance,
+                                          hint_control)
         escalate = should_escalate(decision, state.check_failed)
         state.check_failed = decision.check == "failed"
         if escalate:
             # Stuck: a text model reads the page and writes a hint, then the
             # policy decides again with it. The policy still picks the action.
             pick = f"{decision.operation} {decision.action.label if decision.action else ''}".strip()
-            hint = await reinstruct(adapter=self.text, goal=state.goal, observation=observation,
+            hint = await reinstruct(adapter=self.text, goal=goal, observation=observation,
                                     history=history_for_policy, policy_pick=pick)
             if hint is not None:
                 state.budget.spent(hint.model, tokens_in=hint.usage["prompt_tokens"],
                                    tokens_out=hint.usage["completion_tokens"], latency_ms=hint.latency_ms)
                 state.hint, state.hint_step, guidance = hint, len(state.history), hint.guidance
-                decision = await self._ask_policy(state, observation, history_for_policy, banned,
+                decision = await self._ask_policy(state, observation, goal, history_for_policy, banned,
                                                   guidance, hint.control)
                 if decision.operation in {"DONE", "BLOCKED"} and decision.check == "failed":
                     # The check rejected this stop and the hint did not change it:
                     # keep working. Decide once more without that operation.
-                    decision = await self._ask_policy(state, observation, history_for_policy,
+                    decision = await self._ask_policy(state, observation, goal, history_for_policy,
                                                       {*banned, decision.operation}, guidance, hint.control)
                 state.check_failed = False  # the hint resets the streak
         await self._publish(DecisionEvent(
@@ -335,11 +522,11 @@ class Supervisor:
         ))
         return decision
 
-    async def _ask_policy(self, state: RunState, observation: Observation, history: list[dict],
+    async def _ask_policy(self, state: RunState, observation: Observation, goal: str, history: list[dict],
                           banned: set[str], guidance: str | None, hint_control: str | None) -> Decision:
         """One policy decision, charged to the run's budget. Every call in a
         step, hinted or not, gets the same stale-page and retry handling."""
-        ask = dict(client=self.jev, observation=observation, goal=state.goal, history=history,
+        ask = dict(client=self.jev, observation=observation, goal=goal, history=history,
                    banned=banned, guidance=guidance, hint_control=hint_control)
         try:
             decision = await decide(**ask)
@@ -479,6 +666,9 @@ class Supervisor:
             text=action.value if action.kind == "fill" else None,
             url=outcome.final_url,
         ))
+        # The ledger reads this action at the next observation, once the
+        # reader has confirmed whether the page really changed.
+        state.untracked = (len(state.history) - 1, _item_context(observation))
         state.budget.loaded(outcome.load_ms)
         await self._publish(OutcomeEvent(
             run_id=state.run_id,
@@ -558,19 +748,25 @@ class Supervisor:
         element = observation.by_ref(action.locator or "")
         role = element.role if element else "textbox"
         current_value = element.value if element else None
-        # Fast path: a search field on a run that has a planner-written
-        # `search_term` for the next unfinished item. The planner already knew
-        # the exact query at plan time, so re-asking the text helper on every
-        # fill is pure overhead (one Haiku round-trip, 1-2s on the happy path,
-        # 10s+ on the slow tail). Skipped when: no plan on this supervisor,
-        # the field is a login/address/quantity textbox, every search term has
-        # been typed, or the field already holds the term we would type — the
-        # last case means the model is deliberately re-filling, probably
-        # because the previous query failed, so let the helper refine.
-        if role in {"searchbox", "combobox"} and self.plan is not None:
-            term = _next_search_term(self.plan, state.history, current_value)
-            if term is not None:
+        # Fast path: a search field while the active plan step has a search
+        # term. The planner already knew the exact query at plan time, so
+        # re-asking the text helper on every fill is pure overhead (one model
+        # round-trip, 1-2s on the happy path, 10s+ on the slow tail). The term
+        # is always the ACTIVE step's, so a finished item is never searched
+        # again. When the field already holds that term:
+        # - not searched yet (the URL does not search it): return it unchanged.
+        #   The fill is a no-op the guards then ban, which pushes the policy to
+        #   submit instead of retyping the same query.
+        # - already searched: the policy re-fills on purpose, probably because
+        #   the results did not serve; the helper writes a more specific query.
+        active = state.progress.active if state.progress is not None else None
+        term = active.term if active is not None else ""
+        if role in {"searchbox", "combobox"} and term:
+            holds_term = bool(current_value) and current_value.strip().lower() == term.lower()
+            if not holds_term:
                 return term
+            if not searched_for(observation.url, term):
+                return current_value or term
         history_for_helper: list[dict[str, Any]] = [
             {"step": entry.step, "label": entry.action_label, "page_changed": entry.page_changed}
             for entry in state.history
@@ -578,7 +774,7 @@ class Supervisor:
         try:
             value = await field_value(
                 adapter=self.text,
-                goal=state.goal,
+                goal=self._policy_goal(state),
                 field_name=(element.name if element else action.label) or "",
                 field_role=role,
                 current_value=current_value,
@@ -717,97 +913,61 @@ async def _test_hinted_decisions() -> None:
         raise LoopTestFailure(f"budget charged wrong: {state.budget.tokens_in}")
 
 
-def _test_search_term_fast_path() -> None:
-    """Fast path advances on committing adds matched to subgoals BY NAME,
-    not by raw count: a typed-then-cleared term stays active, a duplicate add
-    on an already-satisfied subgoal does not consume the next subgoal's slot,
-    and the plan is exhausted only when every search subgoal has an add whose
-    label names it."""
+async def _test_search_term_fast_path() -> None:
+    """Unit, stand-in helper. The fast path types the ACTIVE step's term, so a
+    finished item is never searched again whatever its product was called.
+    A field that already holds the term and was not submitted gets the same
+    term back (a no-op the guards ban, so the policy submits); one already
+    searched goes to the helper for a more specific query."""
+    import sys
+
+    from agent.perception import Element, Rect
     from agent.planner import Plan, SubGoal
+    from agent.policy.text_helper import TextValue
 
-    plan = Plan(
-        original_goal="buy cake stuff",
-        refined_goal="search things",
-        start_url="https://example.test/",
-        subgoals=[
-            SubGoal(text="Search 'flour'.", check="flour listings", search_term="flour"),
-            SubGoal(text="Search 'sugar'.", check="sugar listings", search_term="sugar"),
-            SubGoal(text="Stop.", check="done", search_term=None),
-        ],
-    )
+    loop = sys.modules[__name__]
+    helper_calls: list[str] = []
 
-    def fill(step: int, text: str) -> HistoryEntry:
-        return HistoryEntry(step=step, operation="TYPE_TEXT", target=None, action_id="x",
-                            action_label="Search", marker="m", page_changed=True,
-                            url_changed=False, text=text)
+    async def fake_field_value(**kwargs: Any) -> TextValue:
+        helper_calls.append(kwargs["goal"])
+        return TextValue(text="large eggs", model="stand-in", usage={}, latency_ms=1)
 
-    def add(step: int, label: str) -> HistoryEntry:
-        return HistoryEntry(step=step, operation="CLICK", target=None, action_id="x",
-                            action_label=label, marker="m", page_changed=True,
-                            url_changed=False, text=None)
+    plan = Plan(original_goal="buy cake stuff", refined_goal="search things", start_url="https://example.test/",
+                subgoals=[SubGoal(text="Search 'granulated sugar' and add one bag.", check="sugar in cart",
+                                  search_term="granulated sugar", done_when="add"),
+                          SubGoal(text="Search 'eggs' and add one carton.", check="eggs in cart",
+                                  search_term="eggs", done_when="add")])
+    supervisor = Supervisor(executor=None, bus=Bus(), jev=None, text=None, goal="g", plan=plan)  # type: ignore[arg-type]
+    state = RunState(run_id=supervisor.run_id, goal="g", progress=Progress(plan))
 
-    first = _next_search_term(plan, [], current_value=None)
-    if first != "flour":
-        raise LoopTestFailure(f"first fill not the plan's first term: {first!r}")
+    def page(url: str, value: str | None) -> Observation:
+        box = Element(ref="[data-agent-ref=e0]", role="searchbox", name="Search", bounds=Rect(0, 0, 100, 20),
+                      editable=True, value=value)
+        return Observation(url=url, title="t", text="", elements=(box,), marker="m", fingerprint="f", guards={},
+                           can_go_back=False, can_scroll_up=False, can_scroll_down=False, viewport=(1280, 800))
 
-    # Typed-then-cleared flour: no add landed. The next fill must retry flour,
-    # not jump ahead to sugar — the regression that lost Walmart sugar.
-    typed_only = _next_search_term(plan, [fill(1, "flour")], current_value=None)
-    if typed_only != "flour":
-        raise LoopTestFailure(f"typed-only term wrongly advanced: {typed_only!r}")
-
-    # One add matching the flour subgoal → cursor advances to sugar.
-    after_flour_add = _next_search_term(
-        plan, [fill(1, "flour"), add(2, "Add to cart - Great Value Flour")], current_value=None,
-    )
-    if after_flour_add != "sugar":
-        raise LoopTestFailure(f"second fill not the plan's second term: {after_flour_add!r}")
-
-    # DUPLICATE flour add on a page that already added flour: must NOT advance
-    # past sugar. The real Walmart run hit this when the model clicked Add on
-    # the same flour listing twice — the old count-based fast path then said
-    # "7 adds, 7 subgoals, done" even though sugar was never added.
-    dup_flour = _next_search_term(
-        plan,
-        [add(1, "Add to cart - Great Value Flour"),
-         add(2, "Add to cart - Great Value Flour")],
-        current_value=None,
-    )
-    if dup_flour != "sugar":
-        raise LoopTestFailure(f"duplicate flour add wrongly consumed sugar: {dup_flour!r}")
-
-    # Both subgoals satisfied by distinct adds → plan exhausted.
-    all_added = _next_search_term(
-        plan,
-        [add(1, "Add to cart - Flour"), add(2, "Add to cart - Sugar")],
-        current_value=None,
-    )
-    if all_added is not None:
-        raise LoopTestFailure(f"exhausted plan returned {all_added!r}, want None")
-
-    # Out-of-order adds (sugar added before flour) still satisfy by name match.
-    reordered = _next_search_term(
-        plan,
-        [add(1, "Add to cart - Sugar"), add(2, "Add to cart - Flour")],
-        current_value=None,
-    )
-    if reordered is not None:
-        raise LoopTestFailure(f"out-of-order adds should still exhaust the plan: {reordered!r}")
-
-    retry = _next_search_term(plan, [], current_value="flour")
-    if retry is not None:
-        raise LoopTestFailure(f"retry on same term should fall back: got {retry!r}")
-
-    empty = _next_search_term(
-        Plan(original_goal="g", refined_goal="g", start_url="u",
-             subgoals=[SubGoal(text="Stop.", check="done", search_term=None)]),
-        [], current_value=None,
-    )
-    if empty is not None:
-        raise LoopTestFailure(f"plan with no search_term returned {empty!r}, want None")
+    fill = Action(id="t0", kind="fill", label="Search", locator="[data-agent-ref=e0]")
+    saved = loop.field_value
+    loop.field_value = fake_field_value
+    try:
+        first = await supervisor._compose_text(state, page("https://example.test/", None), fill)  # noqa: SLF001
+        # A substitute whose name lacks "granulated" still finishes the sugar step.
+        state.progress.on_add("Add to cart - Great Value Organic Pure Golden Sugar, 900 g")
+        second = await supervisor._compose_text(state, page("https://example.test/s?q=sugar", "granulated sugar"),
+                                                fill)  # noqa: SLF001
+        unsubmitted = await supervisor._compose_text(state, page("https://example.test/s?q=sugar", "eggs"),
+                                                     fill)  # noqa: SLF001
+        refined = await supervisor._compose_text(state, page("https://example.test/s?q=eggs", "eggs"),
+                                                 fill)  # noqa: SLF001
+    finally:
+        loop.field_value = saved
+    if (first, second, unsubmitted, refined) != ("granulated sugar", "eggs", "eggs", "large eggs"):
+        raise LoopTestFailure(f"fast path wrong: {(first, second, unsubmitted, refined)}")
+    if len(helper_calls) != 1 or "Current step: Search 'eggs'" not in helper_calls[0]:
+        raise LoopTestFailure(f"helper not given the one-step goal: {helper_calls}")
 
 
 if __name__ == "__main__":
     asyncio.run(_test_hinted_decisions())
-    _test_search_term_fast_path()
+    asyncio.run(_test_search_term_fast_path())
     print("loop.py inline tests passed")

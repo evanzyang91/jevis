@@ -200,13 +200,39 @@ class FrameEvent(_EventBase):
 # ---- Planning + budget ------------------------------------------------------
 
 
+class PlanStep(BaseModel):
+    """One tracked step of the plan, as the supervisor's ledger sees it."""
+
+    model_config = ConfigDict(frozen=True)
+    text: str
+    status: Literal["pending", "active", "done", "skipped"] = "pending"
+    # What finished it ("added Great Value Flour", "confirmed: ..."), or why
+    # it was skipped. Empty while pending or active.
+    satisfied_by: str = ""
+    search_term: str | None = None
+    # How the step's completion shows: "add", "search", or "page".
+    done_when: str = "page"
+
+
 class PlanEvent(_EventBase):
+    """The plan, and its progress. Emitted once when the plan is made, then
+    again by the supervisor each time a step finishes, is skipped, is
+    rewritten, or is reopened. The latest one is the current state."""
+
     kind: ClassVar[Literal["plan"]] = "plan"
+    # The actionable steps' texts, in order (standing rules are not steps).
     plan: list[str]
+    # The first unfinished step; len(plan) once every step is done or skipped.
     active_index: int
     original_goal: str = ""
     refined_goal: str = ""
     start_url: str = ""
+    steps: list[PlanStep] = Field(default_factory=list)
+    # Rules that hold on every step ("Do not place the order.").
+    constraints: list[str] = Field(default_factory=list)
+    stop_when: str = ""
+    # What changed since the previous plan event, for the trace.
+    note: str = ""
 
 
 class BudgetEvent(_EventBase):

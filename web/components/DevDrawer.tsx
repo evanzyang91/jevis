@@ -105,12 +105,18 @@ function Inspector({ run, decision }: { run: Run | null; decision: DecisionEvent
       </div>
       {plan && (
         <div className="plan">
-          {plan.plan.map((goal, i) => (
-            <div key={i} className={`plan-step ${i === active ? "current" : ""}`}>
-              <span>{i < active ? "✓" : i + 1}</span>
-              {goal}
-            </div>
-          ))}
+          {plan.plan.map((goal, i) => {
+            // Per-step status from the ledger when present; older events only carry the index.
+            const step = plan.steps?.[i];
+            const status = step?.status ?? (i < active ? "done" : i === active ? "active" : "pending");
+            return (
+              <div key={i} className={`plan-step ${status === "active" ? "current" : ""}`}
+                   title={step?.satisfied_by || undefined}>
+                <span>{status === "done" ? "✓" : status === "skipped" ? "–" : i + 1}</span>
+                {goal}
+              </div>
+            );
+          })}
         </div>
       )}
       <div className="metrics">
