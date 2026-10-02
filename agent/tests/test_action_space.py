@@ -127,3 +127,39 @@ def test_summarise_drops_targets_named_in_exclude() -> None:
     banned = next(iter(space_targets))
     questions = summarise(space, exclude={banned})
     assert banned not in questions["click_target"]["criteria"]
+
+
+def _search_page() -> Observation:
+    """Walmart's header: a "Search" combobox and a "Search" button, one label."""
+    return _observation([
+        Element(ref="[data-agent-ref='e0']", role="combobox", name="Search", bounds=_rect(), editable=True),
+        Element(ref="[data-agent-ref='e1']", role="button", name="Search", bounds=_rect()),
+        Element(ref="[data-agent-ref='e2']", role="option", name="granulated sugar, Your recent searches",
+                bounds=_rect()),
+    ])
+
+
+def test_scoped_ban_hides_the_field_but_not_its_same_named_button() -> None:
+    questions = summarise(build(_search_page()), exclude={"TYPE_TEXT:Search"})
+    assert "TYPE_TEXT" not in questions["operation"]["criteria"]
+    assert "type_text_target" not in questions
+    clickable = [entry["element"] for entry in questions["click_target"]["criteria"].values()]
+    assert "[1] Search" in clickable
+
+
+def test_plain_label_ban_still_hides_both_same_named_controls() -> None:
+    questions = summarise(build(_search_page()), exclude={"Search"})
+    assert "TYPE_TEXT" not in questions["operation"]["criteria"]
+    clickable = [entry["element"] for entry in questions["click_target"]["criteria"].values()]
+    assert clickable == ["[2] granulated sugar, Your recent searches"]
+
+
+def test_covered_click_target_carries_what_covers_it() -> None:
+    obs = _observation([
+        Element(ref="[data-agent-ref='e0']", role="button", name="Add to cart - Eggs", bounds=_rect(),
+                covered_by='listbox "Search suggestions"'),
+        Element(ref="[data-agent-ref='e1']", role="button", name="Add to cart - Milk", bounds=_rect()),
+    ])
+    criteria = summarise(build(obs))["click_target"]["criteria"]
+    assert criteria["c0"]["covered_by"] == 'listbox "Search suggestions"'
+    assert "covered_by" not in criteria["c1"]

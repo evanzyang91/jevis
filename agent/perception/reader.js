@@ -209,6 +209,91 @@
     return (hash >>> 0).toString(36);
   };
 
+  // ---- Reachability -----------------------------------------------------
+  // Whether a click on a control lands on it, and if not, what it lands on.
+  // The executor runs the same test before it clicks (browser.py
+  // `_HIT_HELPERS` mirrors these helpers). A layer that paints nothing — an
+  // invisible click-catcher, an opacity-0 dialog stuck mid-animation — does
+  // not count: the executor clicks through it. Only a visible layer (a
+  // suggestion list, a sticky bar, a cookie banner, a dim backdrop) covers.
+  const PAINTED_TAGS = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "LABEL", "IFRAME",
+    "IMG", "SVG", "CANVAS", "VIDEO", "EMBED", "OBJECT", "PICTURE"]);
+  const clearColor = (color) => {
+    if (!color || color === "transparent") return true;
+    const parts = color.match(/[\d.]+/g);
+    return !!parts && parts.length >= 4 && parseFloat(parts[3]) < 0.05;
+  };
+  const opacityOf = (el) => {
+    let opacity = 1;
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+      const value = parseFloat(getComputedStyle(n).opacity);
+      if (!Number.isNaN(value)) opacity *= value;
+    }
+    return opacity;
+  };
+  const paintsNothing = (el) => {
+    if (opacityOf(el) < 0.05) return true;
+    if (el.namespaceURI === "http://www.w3.org/2000/svg") return false;  // an icon or shape paints
+    if (PAINTED_TAGS.has(el.tagName.toUpperCase())) return false;
+    const role = el.getAttribute("role");
+    if (role && INTERACTIVE_ROLES.has(role)) return false;
+    if ([...el.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) return false;
+    const style = getComputedStyle(el);
+    if (style.backgroundImage !== "none" || !clearColor(style.backgroundColor)) return false;
+    if (style.boxShadow !== "none") return false;
+    if (style.backdropFilter && style.backdropFilter !== "none") return false;
+    for (const side of ["Top", "Right", "Bottom", "Left"]) {
+      if (parseFloat(style[`border${side}Width`]) > 0 && !clearColor(style[`border${side}Color`])) return false;
+    }
+    return true;
+  };
+  // A <label> hands its click to its control (styled radios hide the input).
+  const forwardsTo = (hit, el) => {
+    const label = hit.closest && hit.closest("label");
+    return !!label && (label.control === el || label.contains(el));
+  };
+  // The first visible element a click at (x, y) would hit instead of `el`, or
+  // null when the click reaches `el` (or only its own container).
+  const coverAt = (el, x, y) => {
+    for (const hit of document.elementsFromPoint(x, y)) {
+      if (hit === el || el.contains(hit) || forwardsTo(hit, el) || hit.contains(el)) return null;
+      if (!paintsNothing(hit)) return hit;
+    }
+    return null;
+  };
+  // A control counts as covered only when no sample point reaches it.
+  const SAMPLES = [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75]];
+  const coverOf = (el, bounds) => {
+    let first = null;
+    for (const [fx, fy] of SAMPLES) {
+      const x = bounds.x + bounds.w * fx;
+      const y = bounds.y + bounds.h * fy;
+      if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
+      const hit = coverAt(el, x, y);
+      if (!hit) return null;
+      first = first || hit;
+    }
+    return first;
+  };
+  // The layer a covering element belongs to: its popup (list, menu, dialog,
+  // header...) when that does not also hold the control, else the highest
+  // ancestor of the hit that does not hold the control.
+  const POPUP = '[role="dialog"],[role="alertdialog"],[role="listbox"],[role="menu"],[role="tooltip"],'
+    + 'dialog,[aria-modal="true"],header,footer,nav,aside,iframe';
+  const layerOf = (hit, el) => {
+    const popup = hit.closest(POPUP);
+    if (popup && !popup.contains(el)) return popup;
+    let node = hit;
+    while (node.parentElement && !node.parentElement.contains(el)) node = node.parentElement;
+    return node;
+  };
+  const describeLayer = (layer) => {
+    const role = layer.getAttribute("role") || layer.tagName.toLowerCase();
+    const text = (layer.getAttribute("aria-label") || layer.getAttribute("title") || layer.innerText || "")
+      .replace(/\s+/g, " ").trim().slice(0, 60);
+    return text ? `${role} "${text}"` : role;
+  };
+
   const guardOf = (el, snapshot) => hashString(JSON.stringify([
     snapshot.role, snapshot.name, snapshot.value ?? null,
     snapshot.checked ?? null, snapshot.selected ?? null,
@@ -292,6 +377,9 @@
   const MAX_ELEMENTS = 250;
   const elements = [];
   const guards = {};
+  // Covered snapshot -> the layer covering it (its top-level branch), for
+  // the blanket check below.
+  const coveredBy = new Map();
   let index = 0;
   for (const el of document.querySelectorAll(roots)) {
     if (elements.length >= MAX_ELEMENTS) break;
@@ -335,9 +423,99 @@
     if (visible && visible !== name && visible.toLowerCase() !== name.toLowerCase()) {
       snapshot.visible = visible;
     }
+    const hitInstead = coverOf(el, bounds);
+    if (hitInstead) {
+      snapshot.covered_by = describeLayer(layerOf(hitInstead, el));
+      let branch = hitInstead;
+      while (branch.parentElement && !branch.parentElement.contains(el)) branch = branch.parentElement;
+      coveredBy.set(snapshot, branch);
+    }
     guards[ref] = guardOf(el, snapshot);
     elements.push(snapshot);
   }
+
+  // ---- Blanket layer ------------------------------------------------------
+  // One visible layer over most of the page while other controls stay
+  // reachable is a modal in all but name (a backdrop without aria-modal, a
+  // cookie wall): the controls under it cannot be clicked, so they are left
+  // out, as behind an open modal. A layer over a few controls (a suggestion
+  // list, a sticky bar) only marks them `covered_by`; the executor can scroll
+  // or press Escape to reach those. When nothing is reachable at all the
+  // controls stay, so the policy is never left with an empty page.
+  let cover = null;
+  if (coveredBy.size) {
+    const counts = new Map();
+    for (const [snapshot, branch] of coveredBy) {
+      const entry = counts.get(branch) || { count: 0, by: snapshot.covered_by };
+      entry.count += 1;
+      counts.set(branch, entry);
+    }
+    let top = null;
+    for (const [branch, entry] of counts) {
+      if (!top || entry.count > top.entry.count) top = { branch, entry };
+    }
+    const reachable = elements.length - coveredBy.size;
+    const dropped = top.entry.count >= 3 && top.entry.count * 2 >= elements.length && reachable > 0;
+    cover = { by: top.entry.by, count: top.entry.count, dropped };
+    if (dropped) {
+      const kept = elements.filter((snapshot) => coveredBy.get(snapshot) !== top.branch);
+      for (const snapshot of elements) {
+        if (coveredBy.get(snapshot) !== top.branch) continue;
+        const node = document.querySelector(snapshot.ref);
+        if (node) node.removeAttribute("data-agent-ref");
+        delete guards[snapshot.ref];
+      }
+      elements.length = 0;
+      elements.push(...kept);
+    }
+  }
+
+  // ---- Cart count ---------------------------------------------------------
+  // How many items the site's own cart control says the cart holds, from its
+  // accessible name ("Cart contains 13 items Total Amount $87.20", "0 items,
+  // open Order Cart", Amazon's "3 items in cart") or a numeric cart badge.
+  // Read across the whole document, not just the viewport or an open modal:
+  // the count is a fact about the page. Null when no cart control is found.
+  const CART_WORD = /\b(cart|basket|bag|trolley)\b/i;
+  const NOT_CART = /\b(add|remove|delete|save for later|move to|empty|check ?out)\b/i;
+  const PRICE = /(?:[A-Z]{0,3}\$|[€£¥])\s*\d[\d,]*(?:\.\d+)?|\b\d[\d,]*\.\d{2}\b/g;
+  const countIn = (raw, loose) => {
+    const s = raw.replace(PRICE, " ").replace(/\s+/g, " ").trim();
+    if (!CART_WORD.test(s) || NOT_CART.test(s)) return null;
+    const items = s.match(/(\d{1,4})\s*(?:items?|products?|articles?)\b/i);
+    if (items) return Number(items[1]);
+    // A short badge-style name ("Cart (3)", "0 Cart") only on a control that
+    // is structurally the cart, so a product titled "Tote Bag 2 Pack" is not.
+    if (!loose || s.length > 40) return null;
+    const after = s.match(/\b(?:cart|basket|bag|trolley)\b\W{0,3}(\d{1,4})\b/i);
+    if (after) return Number(after[1]);
+    const before = s.match(/(?:^|\D)(\d{1,4})\W{0,3}(?:cart|basket|bag|trolley)\b/i);
+    return before ? Number(before[1]) : null;
+  };
+  const CART_PATH = /\/(cart|basket|bag|trolley)(?:[/?#.]|$)/i;
+  const cartCount = (() => {
+    // A control that is structurally the cart (cart in its id, class, test
+    // id or link path, or sitting in the header) wins over one that only
+    // mentions a cart somewhere on the page.
+    let mention = null;
+    for (const el of document.querySelectorAll('a[href], button, [role="button"], [role="link"]')) {
+      const label = el.getAttribute("aria-label") || "";
+      const attrs = [el.id, typeof el.className === "string" ? el.className : "",
+        el.getAttribute("data-testid") || ""].join(" ");
+      const structural = /cart|basket/i.test(attrs) || CART_PATH.test(el.getAttribute("href") || "")
+        || !!el.closest('header, nav, [role="banner"], [role="navigation"]');
+      if (!structural && !CART_WORD.test(label) && !CART_WORD.test((el.textContent || "").slice(0, 200))) continue;
+      if (!isVisible(el)) continue;
+      const count = countIn(nameOf(el) || "", structural);
+      if (count === null) continue;
+      if (structural) return count;
+      if (mention === null) mention = count;
+    }
+    const badge = document.querySelector('[id*="cart-count" i], [id*="cartcount" i], [class*="cart-count" i], '
+      + '[class*="cartcount" i], [class*="cart-badge" i], [class*="cart-quantity" i], [data-testid*="cart-count" i]');
+    const text = badge && isVisible(badge) ? (badge.textContent || "").trim() : "";
+    return /^\d{1,4}$/.test(text) ? Number(text) : mention;
+  })();
 
   // ---- Dialog status ----------------------------------------------------
   // For an open modal's option groups, across the whole dialog (below its fold
@@ -394,6 +572,9 @@
     // A scroll inside a dialog or panel moves this and nothing above it.
     scrollArea, Math.round(scrollTop),
     document.title,
+    // An add that only moves the cart badge (often below the first 32
+    // controls, or off-screen) is still a page change.
+    cartCount === null ? "" : cartCount,
     elements.length,
     ...elements.map((e) => e.role + "|" + e.name).slice(0, 32),
   ];
@@ -402,6 +583,18 @@
   const text = include_text
     ? (document.body ? document.body.innerText.replace(/\s+/g, " ").trim().slice(0, 6000) : "")
     : "";
+
+  // Nothing rendered yet: no controls, no text, and no large frame, canvas
+  // or video that could be holding the content. `observe` waits on this
+  // instead of handing the policy an empty page (amazon.ca, 2026-10-01: the
+  // first read was empty and the run ended BLOCKED at step 0).
+  const blank = elements.length === 0
+    && !(document.body && document.body.innerText.trim())
+    && ![...document.querySelectorAll("iframe, canvas, video, embed, object")].some((el) => {
+      if (!isVisible(el)) return false;
+      const r = el.getBoundingClientRect();
+      return r.width * r.height >= innerWidth * innerHeight * 0.2;
+    });
 
   // `document.body` can be null on interstitial redirect pages that ship
   // only a <head> before the JS reroute fires. Guard every access.
@@ -429,6 +622,9 @@
     can_scroll_down: canScrollDown,
     scroll_area: scrollArea,
     dialog_status: dialogStatus,
+    cart_count: cartCount,
+    blank,
+    cover,
     // The open modal's own text, for judging what the dialog is. The page
     // text above also holds everything behind it.
     dialog_text: modal ? (modal.innerText || "").replace(/\s+/g, " ").trim().slice(0, 4000) : null,

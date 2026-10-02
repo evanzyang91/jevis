@@ -81,6 +81,11 @@ class Element:
     options: tuple[SelectOption, ...] = ()
     # Radios only: which one-choice group this option belongs to.
     group: str | None = None
+    # What sits on top of this control's centre, as the reader saw it ('listbox
+    # "Search suggestions"', 'header'), when a click there would land on that
+    # instead. None when the control is reachable. Only visible layers count:
+    # an invisible click-catcher is clicked through by the executor.
+    covered_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +132,19 @@ class Observation:
     # How many times `observe` re-read the page waiting for hydration.
     # Diagnostic only; 0 for a page that read cleanly on the first try.
     hydration_retries: int = 0
+    # Items in the cart as the site's own cart control states it ("Cart
+    # contains 13 items", "0 items, open Order Cart", Amazon's badge). None
+    # when no cart control was found. Compare across an "Add to cart" to see
+    # whether the add landed; `HistoryEntry.cart_delta` records that change.
+    cart_count: int | None = None
+    # Nothing rendered yet: no controls, no body text, no large frame or
+    # canvas. `observe` already waited (bounded) before returning one.
+    blank: bool = False
+    # The layer covering the most controls, when one covers any:
+    # {"by": 'div "Sign in"', "count": n, "dropped": bool}. `dropped` means it
+    # blanketed most of the page while other controls stayed reachable, so the
+    # reader left out the controls under it, as it does behind an open modal.
+    cover: dict | None = None
     captured_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def by_ref(self, ref: str) -> Element | None:

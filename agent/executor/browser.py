@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -21,6 +22,7 @@ from playwright.async_api import (
     Browser,
     BrowserContext,
     CDPSession,
+    ElementHandle,
     Locator,
     Page,
     Playwright,
@@ -38,15 +40,180 @@ from .stealth import init_script
 
 _DEFAULT_PROFILE_DIR = Path.home() / ".cache" / "agent" / "profile"
 
-# Roles whose "fill" ends with an Enter press: a search field or a search-with-
-# autocomplete always submits on Enter across the web, so letting the executor
-# commit the fill removes one wasted step per search without any site-specific
-# wiring. Everything else (textbox, spinbutton) requires an explicit submit.
-_SUBMIT_ON_FILL_ROLES = frozenset({"searchbox", "combobox"})
+# Fields whose "fill" ends with a submit: a searchbox, or a combobox that names
+# itself a search (Walmart's "Search"). A search always submits on Enter across
+# the web, so committing the fill removes one wasted step per search without
+# site-specific wiring. An address or location combobox does NOT: Enter there
+# picks a suggestion and can save it to the account. Textbox and spinbutton
+# require an explicit submit (one of several fields in a form).
+_SEARCH_NAME = re.compile(r"\b(search|find)\b|looking for", re.I)
+# How long a submit may take to start a navigation before the executor falls
+# back to the field's own search button.
+_SUBMIT_WAIT_S = 1.5
 
 
-def _commits_on_fill(role: str | None) -> bool:
-    return role in _SUBMIT_ON_FILL_ROLES
+def _commits_on_fill(role: str | None, label: str | None = None) -> bool:
+    if role == "searchbox":
+        return True
+    return role == "combobox" and bool(_SEARCH_NAME.search(label or ""))
+
+
+# ---- Reachability ----------------------------------------------------------
+# Mirrors the helpers in perception/reader.js: whether a click on an element
+# lands on it, and what it lands on instead. An element that paints nothing
+# (opacity ~0, or an empty box with no background, border or text) is an
+# invisible layer the click passes through; anything else covers.
+_HIT_HELPERS = """
+  const INTERACTIVE_ROLES = new Set(["button", "link", "checkbox", "radio", "switch", "tab", "menuitem",
+    "menuitemradio", "option", "gridcell", "combobox", "textbox", "searchbox", "spinbutton"]);
+  const PAINTED_TAGS = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "LABEL", "IFRAME",
+    "IMG", "SVG", "CANVAS", "VIDEO", "EMBED", "OBJECT", "PICTURE"]);
+  const clearColor = (color) => {
+    if (!color || color === "transparent") return true;
+    const parts = color.match(/[\\d.]+/g);
+    return !!parts && parts.length >= 4 && parseFloat(parts[3]) < 0.05;
+  };
+  const opacityOf = (node) => {
+    let opacity = 1;
+    for (let n = node; n && n.nodeType === 1; n = n.parentElement) {
+      const value = parseFloat(getComputedStyle(n).opacity);
+      if (!Number.isNaN(value)) opacity *= value;
+    }
+    return opacity;
+  };
+  const paintsNothing = (node) => {
+    if (opacityOf(node) < 0.05) return true;
+    if (node.namespaceURI === "http://www.w3.org/2000/svg") return false;  // an icon or shape paints
+    if (PAINTED_TAGS.has(node.tagName.toUpperCase())) return false;
+    const role = node.getAttribute("role");
+    if (role && INTERACTIVE_ROLES.has(role)) return false;
+    if ([...node.childNodes].some((n) => n.nodeType === 3 && n.textContent.trim())) return false;
+    const style = getComputedStyle(node);
+    if (style.backgroundImage !== "none" || !clearColor(style.backgroundColor)) return false;
+    if (style.boxShadow !== "none") return false;
+    if (style.backdropFilter && style.backdropFilter !== "none") return false;
+    for (const side of ["Top", "Right", "Bottom", "Left"]) {
+      if (parseFloat(style[`border${side}Width`]) > 0 && !clearColor(style[`border${side}Color`])) return false;
+    }
+    return true;
+  };
+  const forwardsTo = (hit, el) => {
+    const label = hit.closest && hit.closest("label");
+    return !!label && (label.control === el || label.contains(el));
+  };
+  const POPUP = '[role="dialog"],[role="alertdialog"],[role="listbox"],[role="menu"],[role="tooltip"],'
+    + 'dialog,[aria-modal="true"],header,footer,nav,aside,iframe';
+  const describe = (hit, el) => {
+    let layer = hit.closest(POPUP);
+    if (!layer || layer.contains(el)) {
+      layer = hit;
+      while (layer.parentElement && !layer.parentElement.contains(el)) layer = layer.parentElement;
+    }
+    const role = layer.getAttribute("role") || layer.tagName.toLowerCase();
+    const text = (layer.getAttribute("aria-label") || layer.getAttribute("title") || layer.innerText || "")
+      .replace(/\\s+/g, " ").trim().slice(0, 60);
+    return text ? `${role} "${text}"` : role;
+  };
+"""
+
+# Where a click on the element would land. Tries the centre, then four inner
+# points (a badge or a neighbour can cover only the middle). Returns the best
+# point found: {kind: "ok"} reaches it directly; "inert" reaches it through
+# invisible layers only; "ancestor" means the element paints nothing there and
+# its own container takes the click; "content" names the visible layer on top;
+# "offscreen" means no inner point is inside the viewport.
+_REACH_JS = "(el) => {" + _HIT_HELPERS + """
+  const r = el.getBoundingClientRect();
+  const RANK = {ok: 4, inert: 3, ancestor: 2, content: 1};
+  let best = {kind: "offscreen"};
+  for (const [fx, fy] of [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75]]) {
+    const x = r.x + r.width * fx;
+    const y = r.y + r.height * fy;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
+    let found = {kind: "ancestor", x, y};
+    let through = false;
+    for (const hit of document.elementsFromPoint(x, y)) {
+      if (hit === el || el.contains(hit) || forwardsTo(hit, el)) {
+        found = {kind: through ? "inert" : "ok", x, y};
+        break;
+      }
+      if (hit.contains(el)) break;
+      if (paintsNothing(hit)) { through = true; continue; }
+      found = {kind: "content", x, y, by: describe(hit, el)};
+      break;
+    }
+    if (found.kind === "ok") return found;
+    if (!(best.kind in RANK) || RANK[found.kind] > RANK[best.kind]) best = found;
+  }
+  return best;
+}"""
+
+# Make the invisible layers above (x, y) transparent to the pointer so a
+# trusted click there reaches `el`. Each one keeps its old inline value in
+# `data-agent-peel` for `_UNPEEL_JS`. Returns whether the point now reaches
+# `el`; stops at the first visible layer.
+_PEEL_JS = "(el, [x, y]) => {" + _HIT_HELPERS + """
+  for (let i = 0; i < 12; i++) {
+    const hit = document.elementFromPoint(x, y);
+    if (!hit) return false;
+    if (hit === el || el.contains(hit) || forwardsTo(hit, el)) return true;
+    if (hit.contains(el) || !paintsNothing(hit)) return false;
+    hit.setAttribute("data-agent-peel",
+      hit.style.getPropertyValue("pointer-events") + "|" + hit.style.getPropertyPriority("pointer-events"));
+    hit.style.setProperty("pointer-events", "none", "important");
+  }
+  return false;
+}"""
+
+_UNPEEL_JS = """() => {
+  for (const node of document.querySelectorAll("[data-agent-peel]")) {
+    const [value, priority] = node.getAttribute("data-agent-peel").split("|");
+    if (value) node.style.setProperty("pointer-events", value, priority || "");
+    else node.style.removeProperty("pointer-events");
+    node.removeAttribute("data-agent-peel");
+  }
+}"""
+
+# Whether a focused element is a search field: what ENTER may fall back to the
+# field's search button for.
+_IS_SEARCH_FIELD_JS = """(el) => {
+  if (!el || !el.matches) return false;
+  if (el.matches('input[type="search"], [role="searchbox"]')) return true;
+  if (!el.matches('input, textarea, [role="combobox"], [contenteditable="true"]')) return false;
+  const name = [el.getAttribute("aria-label"), el.getAttribute("placeholder"), el.getAttribute("name"),
+    el.id, el.getAttribute("title")].filter(Boolean).join(" ");
+  return /\\b(search|find|q|query)\\b|looking for/i.test(name)
+    || !!el.closest('[role="search"], search, form[action*="search" i]');
+}"""
+
+# A search field's own submit control: a submit button of its form (named
+# Search/Go/Find, or unnamed icon), else a Search-named button in its search
+# landmark or near it. Stamps it `data-agent-submit` and returns whether one
+# was found. Never a clear, voice, camera or close button.
+_FIND_SUBMIT_JS = """(el) => {
+  for (const old of document.querySelectorAll("[data-agent-submit]")) old.removeAttribute("data-agent-submit");
+  const nameOf = (b) => (b.getAttribute("aria-label") || b.getAttribute("title") || b.value || b.innerText || "")
+    .replace(/\\s+/g, " ").trim();
+  const searchy = (n) => /\\bsearch\\b/i.test(n) || /^\\s*(go|find|submit)\\s*$/i.test(n);
+  const NOT = /\\b(clear|reset|close|cancel|voice|camera|image|photo|barcode|scan|back|remove|delete)\\b/i;
+  let scope = el.form || el.closest('form, [role="search"], search');
+  for (let n = el.parentElement, i = 0; !scope && n && i < 4; n = n.parentElement, i++) {
+    const near = [...n.querySelectorAll('button, [role="button"]')];
+    if (near.some((b) => !el.contains(b) && searchy(nameOf(b)))) scope = n;
+  }
+  if (!scope) return false;
+  const shown = (b) => !b.disabled && b.checkVisibility() && b.getBoundingClientRect().width > 0;
+  const submits = (b) => !!el.form && b.form === el.form && (b.tagName === "INPUT"
+    ? ["submit", "image"].includes(b.type)
+    : b.tagName === "BUTTON" && (b.getAttribute("type") || "submit").toLowerCase() === "submit");
+  const buttons = [...scope.querySelectorAll('button, input[type="submit"], input[type="image"], [role="button"]')]
+    .filter((b) => b !== el && !el.contains(b) && shown(b) && !NOT.test(nameOf(b)));
+  const pick = buttons.find((b) => submits(b) && (searchy(nameOf(b)) || !nameOf(b)))
+    || buttons.find((b) => searchy(nameOf(b)));
+  if (!pick) return false;
+  pick.setAttribute("data-agent-submit", "1");
+  return true;
+}"""
 
 
 # In-page settle: resolves once the DOM stops mutating AND no NEW network
@@ -339,9 +506,9 @@ class PlaywrightExecutor:
             elif action.kind == "back":
                 await self.page.go_back(wait_until="domcontentloaded")
             elif action.kind == "enter":
-                await self.page.keyboard.press("Enter")
+                await self._enter()
             elif action.kind == "wait":
-                await asyncio.sleep(0.1)
+                await self._wait_quiet()
         except PlaywrightTimeout as err:
             raise StalePage(f"{action.kind} target vanished before input") from err
         # Click, Enter, Back, and submit-on-fill all frequently trigger
@@ -350,7 +517,7 @@ class PlaywrightExecutor:
         # driven, not a fixed timeout, so a fast site returns in ~200ms while
         # a slow lazy-rendering results page (Amazon, Walmart) takes up to the
         # cap without stalling.
-        submits_fill = action.kind == "fill" and _commits_on_fill(action.role)
+        submits_fill = action.kind == "fill" and _commits_on_fill(action.role, action.label)
         if action.kind in {"click", "enter", "back"} or submits_fill:
             await self._wait_for_settle()
         url_changed = self.page.url != before_url
@@ -439,46 +606,73 @@ class PlaywrightExecutor:
 
     async def _click(self, action: Action) -> None:
         locator = await self._locator(action)
-        box = await locator.bounding_box()
-        if box is None:
-            raise Occluded(f"No box for locator {action.locator}")
-        target = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        # Overlay check. Before firing mouse events at raw coordinates,
-        # verify the topmost element at that pixel IS the intended target
-        # (or a descendant). Walmart pops an autocomplete dropdown over the
-        # results grid whenever the search box holds focus, so a click at
-        # the Add-to-cart button's coordinates actually hits the dropdown
-        # suggestion and navigates to a wrong search. Old jevis has this
-        # check in snapshot.js and returns CoveredTarget on failure.
-        # We first try to dismiss common overlays (blur the active field,
-        # press Escape). If the target is still occluded, raise Occluded so
-        # the supervisor bans the label and re-decides.
-        if not await self._point_hits_target(locator, target):
-            if CLOSE_LABEL.match(action.label or "") and await self._in_open_modal(locator):
-                # The target closes its own dialog and is covered (DoorDash's
-                # overlay layer sits over "Close"): Escape does what the click
-                # means. Done here, with no click after it.
+        await self._press(locator, action.label or "")
+
+    async def _press(self, locator: Locator, label: str) -> None:
+        """Click `locator` so the click lands on it.
+
+        Overlay check first: Walmart pops an autocomplete list over the
+        results grid while the search box holds focus, so a click at an Add
+        button's coordinates would hit a suggestion instead. Old jevis had
+        the same check in snapshot.js. When the element is not on top:
+
+        - a covered "Close" inside an open modal presses Escape instead
+          (DoorDash lays a layer over its dialog's Close);
+        - otherwise the element is scrolled to the middle of its scroller
+          (a sticky header, footer or banner, or a dialog's own sticky
+          title), and outside a modal Escape and a blur close a popup over
+          it (an autocomplete list). Escape is never pressed inside a modal:
+          it would close the dialog and lose every choice made in it;
+        - a layer that paints nothing (an invisible click-catcher, a dialog
+          stuck at opacity 0) is clicked through: it stops taking pointer
+          events for this one trusted click. A DoorDash run lost 28 steps
+          to every control on the page reporting "covered" (2026-10-01);
+        - an element that paints nothing at its own points (its container
+          takes the click) gets a DOM click.
+
+        A visible layer that stays on top raises Occluded naming it.
+        """
+        reach = await self._reach(locator)
+        if reach["kind"] != "ok":
+            in_modal = await self._in_open_modal(locator)
+            if in_modal and CLOSE_LABEL.match(label):
+                # Escape does what the click means. Done here, with no click after it.
                 await self._dismiss_overlay()
                 return
-            if await self._in_open_modal(locator):
-                # Inside an open modal the cover is the dialog's own sticky
-                # header or footer, not an overlay to dismiss: Escape would
-                # close the dialog and lose every choice made in it. Bring the
-                # target into view inside the dialog and test again.
-                await locator.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest'})")
-                await asyncio.sleep(0.15)
-            else:
-                await self._dismiss_overlay()
-            if not await self._point_hits_target(locator, target):
-                box = await locator.bounding_box()
-                target = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2) if box else target
-            if not await self._point_hits_target(locator, target):
-                raise Occluded(f"Target {action.label!r} covered by an overlay")
-            # Overlay dismissal may have shifted layout; refresh coordinates.
-            box = await locator.bounding_box()
-            if box is None:
-                raise Occluded(f"Target {action.label!r} vanished after dismiss")
-            target = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            if reach["kind"] != "inert":
+                await self._scroll_into_view(locator)
+                reach = await self._reach(locator)
+                if reach["kind"] == "content" and not in_modal:
+                    await self._dismiss_overlay()
+                    reach = await self._reach(locator)
+        kind = reach["kind"]
+        if kind == "ok":
+            await self._mouse_click(reach["x"], reach["y"])
+        elif kind == "inert":
+            await self._click_through(locator, label, reach["x"], reach["y"])
+        elif kind == "ancestor":
+            try:
+                await locator.evaluate("el => el.click()", timeout=2000)
+            except PlaywrightTimeout as err:
+                raise StalePage(f"Target {label!r} vanished before input") from err
+            except Exception:  # noqa: BLE001 — the click navigated mid-evaluate: it landed
+                pass
+        elif kind == "content":
+            raise Occluded(f"Target {label!r} covered by {reach.get('by') or 'another layer'}")
+        else:
+            raise Occluded(f"Target {label!r} is outside the viewport")
+
+    async def _reach(self, locator: Locator) -> dict:
+        """Where a click on `locator` lands (see `_REACH_JS`). A target that
+        vanished or a page that navigated away reads as a stale page."""
+        try:
+            return await locator.evaluate(_REACH_JS, timeout=2000)
+        except PlaywrightTimeout as err:
+            raise StalePage("Click target vanished before input") from err
+        except Exception as err:  # noqa: BLE001 — context destroyed: the page moved on
+            raise StalePage(f"Click target unreadable: {str(err)[:120]}") from err
+
+    async def _mouse_click(self, x: float, y: float) -> None:
         # Dispatch mouse press/release via CDP directly, WITHOUT a prior
         # mousemove. `page.mouse.move` would fire a `mousemove` DOM event
         # at the target coordinate, and Walmart product cards react to
@@ -492,39 +686,42 @@ class PlaywrightExecutor:
         for kind in ("mousePressed", "mouseReleased"):
             await cdp.send("Input.dispatchMouseEvent", {
                 "type": kind,
-                "x": target[0],
-                "y": target[1],
+                "x": x,
+                "y": y,
                 "button": "left",
                 "clickCount": 1,
             })
 
-    async def _point_hits_target(self, locator: Locator, point: tuple[float, float]) -> bool:
-        """Whether elementFromPoint at `point` is the located element or a
-        descendant. False on any exception — treat unknown as blocked and
-        let the caller try to dismiss the overlay.
-        """
+    async def _click_through(self, locator: Locator, label: str, x: float, y: float) -> None:
+        """A trusted click at (x, y) with the invisible layers above it made
+        transparent to the pointer for that one click, then restored."""
         try:
-            handle = await locator.element_handle(timeout=500)
-            if handle is None:
-                return False
-            hit = await self.page.evaluate_handle(
-                "({x, y}) => document.elementFromPoint(x, y)",
-                {"x": point[0], "y": point[1]},
+            reaches = await locator.evaluate(_PEEL_JS, [x, y], timeout=2000)
+            if not reaches:
+                raise Occluded(f"Target {label!r} covered by a layer that appeared while clicking")
+            await self._mouse_click(x, y)
+        finally:
+            try:
+                await self.page.evaluate(_UNPEEL_JS)
+            except Exception:  # noqa: BLE001 — the click navigated; nothing left to restore
+                pass
+
+    async def _scroll_into_view(self, locator: Locator) -> None:
+        try:
+            await locator.evaluate(
+                "el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})",
+                timeout=2000,
             )
-            same = await self.page.evaluate(
-                "([target, hit]) => target === hit || (hit && target.contains(hit))",
-                [handle, hit],
-            )
-            return bool(same)
-        except Exception:  # noqa: BLE001 — treat any failure as "not verified"
-            return False
+        except Exception:  # noqa: BLE001 — best effort; the reach test that follows decides
+            return
+        await asyncio.sleep(0.15)
 
     async def _in_open_modal(self, locator: Locator) -> bool:
         """Whether the target sits inside an open modal dialog (aria-modal or a
         native modal <dialog>), as the reader defines one."""
         try:
             return bool(await locator.evaluate(
-                "el => !!el.closest('[aria-modal=\"true\"], dialog:modal')"))
+                "el => !!el.closest('[aria-modal=\"true\"], dialog:modal')", timeout=1500))
         except Exception:  # noqa: BLE001 — unknown: fall back to the old path
             return False
 
@@ -555,36 +752,124 @@ class PlaywrightExecutor:
         delays = typing_delays(action.value, self._rng)
         mean_delay = sum(delays) // len(delays) if delays else 0
         await self.page.keyboard.type(action.value, delay=mean_delay)
-        # Commit on Enter for roles that mean "submit on Enter" everywhere:
-        # a searchbox (any search field, URL bar, filter input) and a combobox
-        # (autocomplete-backed search, address lookup). Saves one step per
+        # Commit a search fill (see `_commits_on_fill`). Saves one step per
         # search — the model otherwise fills, then separately clicks a Search
         # button — and keeps the loop-progress signal (url_changed) tied to
         # the fill rather than deferred to the next step. Textbox and
         # spinbutton do NOT commit here: a textbox is usually one of several
         # fields in a form (login, address) and auto-submitting on the first
         # fill would strand the rest unfilled.
-        if _commits_on_fill(action.role):
+        if _commits_on_fill(action.role, action.label):
             # Short wait for the autocomplete JS to mount before the Enter
             # dispatch — Walmart's combobox opens its suggestions on the last
             # keystroke, and an Enter that lands mid-mount is swallowed.
             await asyncio.sleep(0.12)
-            # Dispatch via CDP, the same path the click uses. `keyboard.press`
-            # routes to whatever element currently holds focus; on an SPA with
-            # an autocomplete popup, that focus can be the popup, not the
-            # input, and the submit handler never fires. `Input.dispatchKeyEvent`
-            # sends the raw key event at the page level with the trusted bit
-            # set, which Walmart's search handler accepts.
-            cdp = await self._ensure_cdp()
-            for kind, text in (("keyDown", "\r"), ("keyUp", "")):
-                await cdp.send("Input.dispatchKeyEvent", {
-                    "type": kind,
-                    "key": "Enter",
-                    "code": "Enter",
-                    "windowsVirtualKeyCode": 13,
-                    "nativeVirtualKeyCode": 13,
-                    **({"text": text, "unmodifiedText": text} if text else {}),
-                })
+            await self._submit(locator)
+
+    async def _press_enter(self) -> None:
+        """A trusted Enter at the focused element, dispatched over CDP (the
+        same input path the click uses, with the `text` a real key carries)."""
+        cdp = await self._ensure_cdp()
+        for kind, text in (("keyDown", "\r"), ("keyUp", "")):
+            await cdp.send("Input.dispatchKeyEvent", {
+                "type": kind,
+                "key": "Enter",
+                "code": "Enter",
+                "windowsVirtualKeyCode": 13,
+                "nativeVirtualKeyCode": 13,
+                **({"text": text, "unmodifiedText": text} if text else {}),
+            })
+
+    async def _submit(self, field: Locator | ElementHandle | None) -> None:
+        """Press Enter in the focused search field; if no navigation starts
+        within `_SUBMIT_WAIT_S`, press the field's own search button.
+
+        Enter is not always enough: an autocomplete can swallow it while its
+        list mounts, and the Walmart run of 2026-10-01 filled Search four
+        times in a row with nothing submitted, while clicking the "Search"
+        button beside the field navigated every time. The fallback presses
+        that button as part of the same fill, so one TYPE_TEXT is one
+        search. A field that filters in place (no navigation) and has no
+        such button is left as typed.
+        """
+        started = asyncio.Event()    # a navigation was requested or committed
+        committed = asyncio.Event()  # the main frame moved to its new URL
+        main = self.page.main_frame
+
+        def on_request(request) -> None:  # noqa: ANN001 — playwright Request
+            try:
+                if request.is_navigation_request() and request.frame == main:
+                    started.set()
+            except Exception:  # noqa: BLE001 — a request without a frame
+                pass
+
+        def on_navigated(frame) -> None:  # noqa: ANN001 — playwright Frame
+            if frame == main:
+                started.set()
+                committed.set()
+
+        self.page.on("request", on_request)
+        self.page.on("framenavigated", on_navigated)
+        stamped = False
+        try:
+            await self._press_enter()
+            if field is None:
+                return
+            try:
+                await asyncio.wait_for(started.wait(), timeout=_SUBMIT_WAIT_S)
+            except TimeoutError:
+                pass
+            if started.is_set():
+                # A full page load: hold until the new URL commits, so the
+                # outcome reports url_changed and the read sees the results.
+                try:
+                    await asyncio.wait_for(committed.wait(), timeout=8.0)
+                except TimeoutError:
+                    pass
+                return
+            try:
+                if isinstance(field, Locator):  # a re-rendered field must not stall on the default timeout
+                    stamped = bool(await field.evaluate(_FIND_SUBMIT_JS, timeout=1500))
+                else:
+                    stamped = bool(await field.evaluate(_FIND_SUBMIT_JS))
+                if stamped:
+                    await self._press(self.page.locator("[data-agent-submit]").first, "Search")
+            except Exception:  # noqa: BLE001 — best effort: the field holds the text either way
+                pass
+        finally:
+            self.page.remove_listener("request", on_request)
+            self.page.remove_listener("framenavigated", on_navigated)
+            if stamped:
+                try:
+                    await self.page.evaluate(
+                        "() => document.querySelectorAll('[data-agent-submit]')"
+                        ".forEach((b) => b.removeAttribute('data-agent-submit'))")
+                except Exception:  # noqa: BLE001 — navigated away; nothing to clean
+                    pass
+
+    async def _enter(self) -> None:
+        """ENTER: press Enter at the focused element. In a search field, fall
+        back to its search button when Enter starts no navigation."""
+        field: ElementHandle | None = None
+        try:
+            handle = await self.page.evaluate_handle("document.activeElement")
+            field = handle.as_element()
+            if field is not None and not await field.evaluate(_IS_SEARCH_FIELD_JS):
+                field = None
+        except Exception:  # noqa: BLE001 — no readable focus: a plain Enter
+            field = None
+        await self._submit(field)
+
+    async def _wait_quiet(self) -> None:
+        """WAIT: give a loading page real time — network idle (bounded), then
+        the DOM settle. It used to sleep 0.1s, so the policy re-picked WAIT
+        while a results page was still hydrating."""
+        await asyncio.sleep(0.4)
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=2500)
+        except PlaywrightTimeout:
+            pass
+        await self._wait_for_settle(quiet_ms=300, cap_ms=2000)
 
     async def _select(self, action: Action) -> None:
         locator = await self._locator(action)
