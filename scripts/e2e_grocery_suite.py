@@ -3,24 +3,38 @@ prompts were not tuned on (fried rice, pasta night, tacos, a sandwich lunch,
 breakfast for two, a quantity request), plus the cake run as a control.
 
 Each case is checked for SAFETY (scripts/e2e_run.py: the plan forbids ordering,
-no checkout control or page) and for RESULT: the cart is emptied before the run
-and read after it, and every core item of the case must be in it (a few
-acceptable words per item, so a reasonable substitute passes).
+no checkout control or page) and for RESULT: the cart is read after the run, in
+the run's own tab, and emptied; every core item of the case must be among the
+lines the run added (a few acceptable words per item, so a reasonable
+substitute passes; a quantity the goal asked for must match). Duplicates and
+unasked extra units are reported, not failed. What a case could not remove is
+kept in ~/.cache/agent/evals/cart-left.json and subtracted from the next case.
 
 Runs in a dedicated test Chrome, never the user's own: AGENT_CDP_URL is forced
 to E2E_CDP_URL (default http://127.0.0.1:9333, a guest session), and the relay
 profile is cleared. Each case runs in its own process under
 `/usr/bin/lockf -k /tmp/htn-live.lock`, so only one live run hits a site at a
-time and the cart read before and after a case is not raced by another run.
-A bot or human-verification page stops that case (recorded as `botblock`); the
-suite never tries to solve one.
+time and the cart read after a case is not raced by another run. A bot or
+human-verification page stops that case (recorded as `botblock`, not a policy
+failure); the suite never tries to solve one, and waits before the next case.
+walmart.ca's check fired most often right after an extra cart visit, so the
+suite makes none before a run unless --preclear asks for it.
 
-Run:   uv run python scripts/e2e_grocery_suite.py [case-id ...] [--label NAME]
+Every policy decision's full input (observation, goal, history, bans, hint) is
+dumped to case-<run>.decisions.jsonl; --replay re-asks the current policy on
+those steps with no browser, to test a prompt change against a real failure.
+
+Run:   uv run python scripts/e2e_grocery_suite.py [case-id ...] [--label NAME] [--times N]
+       uv run python scripts/e2e_grocery_suite.py tacos --into ~/.cache/agent/evals/<dir>   # add runs
+       uv run python scripts/e2e_grocery_suite.py --replay <dir>/case-pasta.decisions.jsonl --steps 6,8
        uv run python scripts/e2e_grocery_suite.py --list
-Env:   E2E_CDP_URL     test Chrome's debugging URL, default http://127.0.0.1:9333
-       E2E_TIMEOUT_S   per-case limit, default 900
-       E2E_LOCK        lock file, default /tmp/htn-live.lock
-Out:   ~/.cache/agent/evals/<stamp>-<label>/ suite.json, summary.md, one case-<id>.json each.
+Env:   E2E_CDP_URL           test Chrome's debugging URL, default http://127.0.0.1:9333 (never 'auto')
+       E2E_TIMEOUT_S         per-case limit, default 900
+       E2E_LOCK              lock file, default /tmp/htn-live.lock
+       E2E_GAP_S             pause after a case, still holding the lock, default 30
+       E2E_BLOCK_COOLDOWN_S  pause after a bot check, without the lock, default 600
+       HINT_MODEL            optional registry id for the stuck-step hint model (policy/reinstruct.py)
+Out:   ~/.cache/agent/evals/<stamp>-<label>/ suite.json, summary.md, one case-<run>.json each.
 Exit:  0 when every case passes its RESULT and SAFETY checks, else 1.
 """
 
