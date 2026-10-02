@@ -31,7 +31,7 @@ from agent.perception.captcha import probe as probe_page
 from agent.planner import MAX_REPAIRS, Change, Plan, Progress, cart_count, is_committing, repair, verify
 from agent.planner.progress import DONE, SKIPPED, product_of, searched_for
 from agent.policy import Decision, NoFieldValue, decide, field_value, should_escalate
-from agent.policy.action_space import build, is_banned
+from agent.policy.action_space import build, is_banned, resolve
 from agent.policy.jev_policy import commits_product, in_cart_products, item_for, policy_bans
 from agent.policy.reinstruct import HINT_STEPS, Hint, evidence_present, reinstruct
 from agent.providers import JevClient, TextAdapter
@@ -85,6 +85,8 @@ CART_SETTLE_S = 1.5
 # items took 3-5 actions; a run thrashing on "green onions" (no such product)
 # spent 25+ without ever choosing BLOCKED (2026-10-01, run 27280578).
 STEP_ACTION_LIMIT = 16
+# Scrolls `_reveal` makes on one page for one step before the policy decides.
+REVEAL_LIMIT = 2
 
 
 def plan_event(run_id: UUID, seq: int, plan: Plan, progress: Progress | None = None, note: str = "") -> PlanEvent:
@@ -174,6 +176,11 @@ class RunState:
     recall_failed: set[str] = field(default_factory=set)
     # Step index -> (site, term, product) of a product add credited this run.
     added: dict[int, tuple[str, str, str]] = field(default_factory=dict)
+    # (active step index, cart count when it became active): an add step's
+    # DONE needs the count above it (see `_add_unproven`).
+    step_cart: tuple[int, int | None] | None = None
+    # Scrolls `_reveal` made, by "<step index>|<url>".
+    reveals: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -274,7 +281,7 @@ class Supervisor:
                     done_reason = self._with_progress(
                         state, "url cycling: last dozen navigations only revisited 2-3 pages")
                     break
-                decision = await self._recall(state, observation)
+                decision = await self._reveal(state, observation) or await self._recall(state, observation)
                 if decision is None:
                     decision = await self._decide(state, observation)
                 if decision.operation == "DONE" and state.progress is not None:
@@ -401,6 +408,10 @@ class Supervisor:
                     changes.append(progress.complete(active, f"already in the cart: {held}", product=held))
         if any(change.status == DONE for change in changes):
             state.skips_in_a_row = 0
+        active = progress.active
+        if active is not None and (state.step_cart is None or state.step_cart[0] != active.index
+                                   or state.step_cart[1] is None):
+            state.step_cart = (active.index, progress.cart_last)
         return changes
 
     async def _publish_progress(self, state: RunState, note: str) -> None:
@@ -520,24 +531,54 @@ class Supervisor:
         if pick is None:
             return None
         operation_id, target = pick
-        decision = Decision(
-            operation=operation_id, target=target.id, action=target.action, confidence=1.0,
-            probabilities={target.id: 1.0}, model="memory", latency_ms=0, usage={},
-            withheld=tuple(sorted(banned)),
-        )
+        return await self._scripted(state, operation_id, target.id, target.action, model="memory",
+                                    banned=banned)
+
+    async def _reveal(self, state: RunState, observation: Observation) -> Decision | None:
+        """Scroll toward the control that finishes the step when it is not on
+        screen, without asking the model. An add step on its search results
+        with no add control in view: the controls sit below the fold (Walmart
+        shows only the favourite hearts of the first row), and the policy,
+        offered only filters and site chrome, clicked category chips, the
+        cart and the home page instead (2026-10-01). At most REVEAL_LIMIT
+        scrolls per page and step; then the policy decides as usual."""
+        active = state.progress.active if state.progress is not None else None
+        if (active is None or active.step.done_when != "add" or not active.term
+                or not observation.can_scroll_down or observation.scroll_area == "dialog"
+                or not searched_for(observation.url, active.term)):
+            return None
+        names = [element.name or "" for element in observation.elements]
+        if any(is_add_label(name) or commits_product(name) for name in names) or in_cart_products(observation):
+            return None
+        key = f"{active.index}|{observation.url}"
+        if state.reveals.get(key, 0) >= REVEAL_LIMIT:
+            return None
+        state.reveals[key] = state.reveals.get(key, 0) + 1
+        action = resolve(build(observation), "SCROLL_DOWN", None)
+        if action is None:
+            return None
+        return await self._scripted(state, "SCROLL_DOWN", None, action, model="reveal")
+
+    async def _scripted(self, state: RunState, operation: str, target: str | None, action: Action, *,
+                        model: str, banned: set[str] | frozenset[str] = frozenset()) -> Decision:
+        """A decision the supervisor made without the policy (memory, reveal),
+        published like any other so the trace shows where it came from."""
+        choice = target or operation
         await self._publish(DecisionEvent(
             run_id=state.run_id,
             seq=await self.bus.next_seq(),
-            operation=operation_id,
-            choice=target.id,
-            target=target.id,
-            probabilities={target.id: 1.0},
+            operation=operation,
+            choice=choice,
+            target=target,
+            probabilities={choice: 1.0},
             confidence=1.0,
-            model="memory",
-            remembered=True,
+            model=model,
+            remembered=model == "memory",
             banned=sorted(banned),
         ))
-        return decision
+        return Decision(operation=operation, target=target, action=action, confidence=1.0,
+                        probabilities={choice: 1.0}, model=model, latency_ms=0, usage={},
+                        withheld=tuple(sorted(banned)))
 
     async def _claim_done(self, state: RunState, observation: Observation) -> bool:
         """The policy said DONE while steps remain: finish the active step if
@@ -777,6 +818,8 @@ class Supervisor:
         labels to hide for this decision only (DONE after a rejected claim)."""
         banned = combined_ban(state.history, observation.marker, covered=state.covered) | set(ban)
         banned = _search_left_open(state, observation, banned)
+        if _add_unproven(state, observation):
+            banned.add("DONE")
         goal = self._policy_goal(state)
         history_for_policy = self._history_for_policy(state)
         # A hint lasts HINT_STEPS steps, and only while its evidence is on the page.
@@ -1328,6 +1371,24 @@ def _host(url: str) -> str:
 
 def _plain_name(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip().lower()
+
+
+def _add_unproven(state: RunState, observation: Observation) -> bool:
+    """The active step is an add, the page reads a cart count, and it has not
+    risen since the step began, nor does the page show the item in the cart:
+    DONE cannot be true, so the policy is not offered it. The step finishes
+    by itself when an add lands. A page with no readable count leaves DONE
+    to the verifier."""
+    active = state.progress.active if state.progress is not None else None
+    if active is None or active.step.done_when != "add" or state.step_cart is None:
+        return False
+    index, before = state.step_cart
+    if index != active.index or before is None or observation.cart_count is None:
+        return False
+    if observation.cart_count > before:
+        return False
+    term = active.term.lower()
+    return not (term and any(item_for(f"Add to cart - {product}", [term]) for product in in_cart_products(observation)))
 
 
 def _search_left_open(state: RunState, observation: Observation, banned: set[str]) -> set[str]:

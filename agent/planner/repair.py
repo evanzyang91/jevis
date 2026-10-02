@@ -67,9 +67,15 @@ async def repair(
             raise ValueError("empty rewritten step")
         raw_term = parsed.get("search_term")
         term = raw_term.strip() if isinstance(raw_term, str) and raw_term.strip() else None
+        # Keep the step's kind unless its new wording plainly adds an item.
+        done_when = done_when_for(text, term, step.done_when)
+        if term is None and done_when in {"add", "search"}:
+            # "Choose Barilla Farfalle from the current results" names no new
+            # query, but the step still needs its old one: without it the
+            # search field, the typed-term fast path and memory all lost it.
+            term = step.search_term
         new = SubGoal(text=text, check=str(parsed.get("check") or "").strip() or text, search_term=term,
-                      # Keep the step's kind unless its new wording plainly adds an item.
-                      done_when=done_when_for(text, term, step.done_when))
+                      done_when=done_when)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as err:
         raise PlannerError(f"Repair response unusable: {result.text[:200]}") from err
     return Repair(step=new, reason="rewritten", model=result.model, usage=usage, latency_ms=result.latency_ms)

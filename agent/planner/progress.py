@@ -122,6 +122,23 @@ def searched_for(url: str, term: str) -> bool:
     return bool(wanted) and wanted <= words(query)
 
 
+def finish_line(step: SubGoal) -> str:
+    """What finishes a step, in words the policy reads with it: the page state
+    the planner named, and how the supervisor sees it. Without it the policy
+    judged a pasta step done on the store's home page (its own check cleared
+    DONE at 0.72), and on a results page whose add controls sat below the
+    fold it clicked category chips instead of scrolling to them."""
+    check = (step.check or step.text).strip().rstrip(".")
+    state = check[:1].lower() + check[1:]
+    if step.done_when == "add":
+        return (f"{state or 'the item is in the cart'}. It finishes by itself when an add control for a "
+                "fitting product lands: choose that add control. When the results show no add control, "
+                "SCROLL_DOWN to reach it. Never choose DONE before an add landed.")
+    if step.done_when == "search":
+        return f"{state or 'the search is submitted'}. It finishes by itself once the search is submitted."
+    return f"the page shows this: {check}. Choose DONE once it does; DONE is checked against the page."
+
+
 @dataclass(slots=True)
 class StepState:
     index: int
@@ -212,6 +229,7 @@ class Progress:
             lines.append("Skipped steps, never retry them: " + "; ".join(plain(s.name) for s in skipped) + ".")
         if active is not None:
             lines.append(f"Current step: {active.step.text.strip()}")
+            lines.append(f"The current step is finished when {finish_line(active.step)}")
             later = [s for s in self.steps if s.status == PENDING and s is not active]
             if later:
                 lines.append("Later steps, not now: " + "; ".join(plain(s.name) for s in later) + ".")
