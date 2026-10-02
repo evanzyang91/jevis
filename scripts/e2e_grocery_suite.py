@@ -138,6 +138,8 @@ _HEADER = re.compile(r"cart contains (\d+) items?", re.I)
 BOT_TEXT = ("robot or human", "press & hold", "press and hold", "verify you are human",
             "we like real shoppers, not robots", "access denied")
 BOT_CONTROLS = re.compile(r"^(try a different method|press (&|and) hold|human challenge)", re.I)
+_HINT_SAYS_HUMAN_CHECK = re.compile(
+    r"human[- ]verification|captcha|robot or human|verification (check|challenge|prompt)", re.I)
 
 
 def _human_check(preview: str, controls: list[str]) -> bool:
@@ -366,6 +368,13 @@ async def _drive(goal: str, url: str, timeout_s: float) -> dict:
                                           "check": event.check, "check_p": round(event.check_p, 3),
                                           "switch": event.check_switch, "switched": event.switched,
                                           "escalate": event.escalate, "guidance": event.guidance})
+                if _HINT_SAYS_HUMAN_CHECK.search(event.guidance or ""):
+                    # The hint model read the whole page and saw the human check
+                    # that the 240-character preview cut off.
+                    seen["captchas"] += 1
+                    seen["status"], seen["reason"] = "botblock", f"hint saw a human check: {event.guidance[:120]}"
+                    print("botblock: the hint saw a human check (not solved; case stopped)", flush=True)
+                    break
             elif isinstance(event, ActionEvent):
                 seen["actions"].append({"kind": event.action_kind, "label": event.target_label})
                 print(f"  step {len(seen['actions']):3}: {event.action_kind} {event.target_label!r}", flush=True)

@@ -35,6 +35,7 @@ CHECK_PASS = 0.7
 # carton of eggs, both below this bar and above CHECK_TRIGGER. A failed check
 # here escalates at once (see should_escalate).
 COMMIT_TRIGGER = 0.8
+VETO_ROUNDS = 2
 CHECK_CANDIDATES = 3
 # Act on the check's best candidate when it clears and is not the policy's pick
 # ("open X" -> "Add to cart - X"). Only within the same operation's targets, or
@@ -208,6 +209,8 @@ class Decision:
     committing: bool = False
     # The product add refused before this answer (see `decide`), if any.
     vetoed: str | None = None
+    # Product adds this step's check scored hopeless (below CHECK_HOPELESS).
+    rejected: tuple[str, ...] = ()
 
 
 def _reduced(space: ActionSpace, keep: int) -> ActionSpace:
@@ -281,19 +284,29 @@ async def decide(
     action space when the server reports the request oversized.
 
     A product add whose step check is hopeless (below CHECK_HOPELESS, no
-    better candidate cleared) is not executed: the policy is asked once more
-    without it. The check scored 0.01 for a mayonnaise dip as pasta sauce and
-    0.23 for a second rice after rice was added, both picks a live run made.
-    The answer then carries `vetoed`, which escalates the step for a hint."""
+    better candidate cleared) is not executed: the policy is asked again
+    without it and without every other add the same check found hopeless, at
+    most VETO_ROUNDS times. The check scored 0.01 for a mayonnaise dip as pasta
+    sauce and 0.23 for a second rice after rice was added, both picks a live
+    run made; a single refusal let the next pick be a rice side dish the check
+    had already scored 0.05. The answer then carries `vetoed`, which escalates
+    the step for a hint."""
     ask = dict(client=client, observation=observation, goal=goal, history=history, guidance=guidance,
                hint_control=hint_control)
-    first = await _decide_once(banned=banned, **ask)
-    refused = first.action.label if first.action is not None else ""
-    if not (first.committing and first.check == "failed" and first.check_p < CHECK_HOPELESS and not first.switched):
-        return first
-    second = await _decide_once(banned={*banned, refused}, **ask)
-    return replace(second, vetoed=refused, usage=_usage_sum(first.usage, second.usage),
-                   latency_ms=first.latency_ms + second.latency_ms)
+    decision = await _decide_once(banned=banned, **ask)
+    refused: list[str] = []
+    usage, latency = dict(decision.usage), decision.latency_ms
+    for _ in range(VETO_ROUNDS):
+        # Refused when the pick's own score is hopeless, even if another candidate scored higher.
+        if not (decision.committing and decision.check == "failed" and not decision.switched
+                and decision.action is not None and decision.action.label in decision.rejected):
+            break
+        refused += [decision.action.label, *(label for label in decision.rejected if label not in refused)]
+        decision = await _decide_once(banned={*banned, *refused}, **ask)
+        usage, latency = _usage_sum(usage, decision.usage), latency + decision.latency_ms
+    if not refused:
+        return decision
+    return replace(decision, vetoed=refused[0], usage=usage, latency_ms=latency)
 
 
 async def _decide_once(
@@ -433,6 +446,7 @@ async def _decide_once(
     switched = False
     terminal = operation in {"DONE", "BLOCKED"}
     committing = target is not None and commits_product(chosen_label)
+    rejected: tuple[str, ...] = ()
     if target is None and not terminal and signal < CHECK_TRIGGER:
         # Unsure between kinds of action (scroll, wait, back...): the check has
         # nothing concrete to judge. Each scroll of a loop looks reasonable alone
@@ -451,6 +465,9 @@ async def _decide_once(
         check = await check_step(client=client, goal=goal, page=state["page"],
                                  recent_actions=state["recent_actions"],
                                  candidates=[label for _, label in shortlist], screen=screen)
+        if check is not None:
+            rejected = tuple(label for (_, label), score in zip(shortlist, check.scores)
+                             if commits_product(label) and score < CHECK_HOPELESS)
         if CHECK_SWITCH and check is not None and check.switch_index:
             new_key = shortlist[check.switch_index][0]
             if target is not None:
@@ -497,6 +514,7 @@ async def _decide_once(
         check_switch=check.switch if check else None,
         switched=switched,
         committing=action is not None and commits_product(action.label or ""),
+        rejected=rejected,
     )
 
 
@@ -521,12 +539,22 @@ def commits_product(label: str) -> bool:
 _DETOUR = re.compile(r"^(?:sign in|log ?in|create (?:an )?account)\b|\b(?:add|save) to (?:my )?"
                      r"(?:favou?rites|wish ?list|registry)\b", re.I)
 _ACCOUNT_GOAL = re.compile(r"sign in|log ?in|account|favou?rite|wish ?list|registry", re.I)
+# Site chrome no goal step needs: a stuck pasta run clicked "Language English"
+# (a language switch), "Legal" and "Claim offer now" while its search results
+# sat below the fold. Withheld unless the goal names them.
+_SITE_CHROME = re.compile(r"^(?:language|legal|claim offer|privacy|terms of|accessibility|careers|feedback)\b",
+                          re.I)
 
 
 def _detour_bans(observation: Observation, goal: str) -> set[str]:
-    if _ACCOUNT_GOAL.search(goal):
-        return set()
-    return {element.name for element in observation.elements if element.name and _DETOUR.search(element.name)}
+    account = bool(_ACCOUNT_GOAL.search(goal))
+    banned: set[str] = set()
+    for element in observation.elements:
+        name = element.name or ""
+        if (not account and _DETOUR.search(name)) or (
+                (match := _SITE_CHROME.match(name)) and match.group().lower() not in goal.lower()):
+            banned.add(name)
+    return banned
 
 
 # The planner writes one "Search '<term>'" per item. A product's add control

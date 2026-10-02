@@ -117,8 +117,8 @@ async def test_an_add_that_did_not_change_the_page_does_not_finish_the_item() ->
 
 async def test_favourites_and_sign_in_detours_are_not_offered() -> None:
     jev = _Jev()
-    page = _page(["Sign in to add to Favourites list, Great Value Soya Sauce", "Sign In Account",
-                  "Add to cart - Silver Swan Soy Sauce"])
+    page = _page(["Sign in to add to Favourites list, Great Value Soya Sauce", "Sign In Account", "Language English",
+                  "Legal", "Add to cart - Silver Swan Soy Sauce"])
     await decide(client=jev, observation=page, goal=GOAL, history=[])  # type: ignore[arg-type]
     assert jev.offered == ["Add to cart - Silver Swan Soy Sauce"]
     jev = _Jev()
@@ -140,13 +140,13 @@ async def test_an_unsure_add_is_checked_and_a_failed_check_escalates_at_once() -
 
 
 class _VetoJev(_Jev):
-    """Prefers the mayonnaise add; the check scores it 0.01 and anything else 0.3."""
+    """Prefers the mayonnaise add; the check scores it 0.01 and anything else 0.6 (doubtful, not hopeless)."""
 
     async def ask(self, *, state: dict[str, Any], questions: dict[str, Any]) -> JevResult:
         if "c0" in questions:
             self.checks += 1
             return JevResult(answers={}, model="stand-in", usage={}, latency_ms=0, nouls={
-                key: NoulAnswer(noul=0.01 if "Mayonnaise" in state["candidates"][int(key[1:])] else 0.3)
+                key: NoulAnswer(noul=0.01 if "Mayonnaise" in state["candidates"][int(key[1:])] else 0.6)
                 for key in questions})
         return await super().ask(state=state, questions=questions)
 
