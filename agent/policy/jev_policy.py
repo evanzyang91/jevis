@@ -625,14 +625,31 @@ def _duplicate_add_bans(space: ActionSpace, goal: str, history: Iterable[Mapping
     """Add controls for an item already added or already in the cart. One cake
     run put three cartons of eggs in the cart; NEXT_ACTION forbade it in words.
     A goal that wants several of an item raises the quantity on the product
-    already added."""
+    already added.
+
+    On the results of the last search, when that search was for an item now
+    finished, every add that serves no unfinished item is withheld too: with
+    spaghetti in the cart, the policy added "DeCecco High Protein Pasta" from
+    the spaghetti results, a product whose name holds no item's words."""
     done = finished_items(goal, history, observation)
     if not done:
         return set()
     items = goal_items(goal)
-    return {target.label for operation in space.operations if operation.id == "CLICK"
-            for target in operation.targets
-            if commits_product(target.label) and item_for(target.label, items) in done}
+    queries = [str(entry.get("text")) for entry in history
+               if entry.get("operation") == "TYPE_TEXT" and entry.get("text")]
+    searched = item_for(f"Add to cart - {queries[-1]}", items) if queries else None
+    on_finished_results = searched in done
+    banned: set[str] = set()
+    for operation in space.operations:
+        if operation.id != "CLICK":
+            continue
+        for target in operation.targets:
+            if not commits_product(target.label):
+                continue
+            item = item_for(target.label, items)
+            if item in done or (on_finished_results and item is None):
+                banned.add(target.label)
+    return banned
 
 
 def _title_sibling_bans(space: ActionSpace) -> set[str]:

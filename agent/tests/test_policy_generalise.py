@@ -117,6 +117,15 @@ async def test_an_item_the_page_shows_in_the_cart_is_finished() -> None:
     assert "Add to cart - Great Value Large 12 Eggs" in jev.offered
 
 
+async def test_on_a_finished_items_results_no_other_product_is_added() -> None:
+    history = [{"operation": "TYPE_TEXT", "label": "Search", "text": "rice", "page_changed": True},
+               {"operation": "CLICK", "label": "Add to cart - Sitara Basmati Rice", "page_changed": True}]
+    jev = _Jev()
+    page = _page(["Add to cart - Uncle Ben's Converted", "Add to cart - Great Value Large 12 Eggs", "Search"])
+    await decide(client=jev, observation=page, goal=GOAL, history=history)  # type: ignore[arg-type]
+    assert jev.offered == ["Add to cart - Great Value Large 12 Eggs", "Search"]
+
+
 async def test_an_add_that_did_not_change_the_page_does_not_finish_the_item() -> None:
     history = [{"operation": "CLICK", "label": "Add to cart - Sitara Basmati Rice", "page_changed": False}]
     jev = _Jev()
