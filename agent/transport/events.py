@@ -241,6 +241,7 @@ class BudgetEvent(_EventBase):
     model_ms: int
     load_ms: int
     usd: float
+    final: bool = False  # the run's totals, sent once however it ended
 
 
 class CaptchaEvent(_EventBase):

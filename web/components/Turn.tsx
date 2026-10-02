@@ -50,13 +50,12 @@ export function Turn({ run, frame, showBrowser, cursor, onResumeCaptcha }: Props
             </div>
           )}
           {/* The browser sits ABOVE the thinking trace. New steps grow below
-              it and never push it around — layout stays stable, and the
-              sticky offset keeps it visible while the step list scrolls. */}
+              it and never push it around, and it scrolls with them rather
+              than covering them. */}
           {showBrowser && (
             <div className={`turn-browser ${running ? "running" : ""} ${check ? "handoff" : ""}`}>
               <LiveBrowser frame={frame} url={url} live={running} cursor={cursor} />
-              {/* Over the live view, which is sticky and so always on screen,
-                  and which looks like a browser but takes no clicks. */}
+              {/* Over the live view, which looks like a browser but takes no clicks. */}
               {check && <CheckNotice check={check} onContinue={onResumeCaptcha} overlay />}
             </div>
           )}
@@ -168,19 +167,32 @@ function CheckLine({ check }: { check: HumanCheck }) {
   return <p className={`check-line ${tone}`}>{text}</p>;
 }
 
+// "42.3 s", "2 min 5 s".
+const took = (ms: number) => {
+  const total = Math.max(0, ms / 1000);
+  if (total < 60) return `${total.toFixed(1)} s`;
+  const whole = Math.round(total);
+  return `${Math.floor(whole / 60)} min${whole % 60 ? ` ${whole % 60} s` : ""}`;
+};
+
+// Shown for every finished task, however it ended: what it cost and how long it took.
 function Results({ run }: { run: Run }) {
   const budget = run.budget;
-  if (!budget && run.steps.length === 0) return null;
   const elapsed = (run.endedAt ?? Date.now()) - run.startedAt;
   return (
     <div className="cost">
       <div className="result-head">
-        <div className="result-figure">{budget ? money(budget.usd) : "–"}</div>
-        <div className="result-caption">total for this task</div>
+        <div className="result-stat">
+          <div className="result-figure">{budget ? money(budget.usd) : "–"}</div>
+          <div className="result-caption">cost</div>
+        </div>
+        <div className="result-stat">
+          <div className="result-figure">{took(elapsed)}</div>
+          <div className="result-caption">time</div>
+        </div>
       </div>
       <div className="tiles">
         <Tile label="Steps" value={String(run.steps.length)} />
-        <Tile label="Time" value={`${(elapsed / 1000).toFixed(1)}s`} />
         <Tile label="Model" value={`${((budget?.model_ms ?? run.modelMs) / 1000).toFixed(1)}s`} note="thinking" />
         <Tile label="Pages" value={`${((budget?.load_ms ?? 0) / 1000).toFixed(1)}s`} note="loading" />
         <Tile

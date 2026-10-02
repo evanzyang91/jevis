@@ -141,7 +141,7 @@ export function reduce(run: Run, event: StreamEvent): Run {
       break;
     }
     case "budget":
-      if (event.steps > 0 || event.usd > 0 || event.model_ms > 0) next.budget = event; // skip the start heartbeat
+      if (event.final || event.steps > 0 || event.usd > 0 || event.model_ms > 0) next.budget = event; // skip the start heartbeat
       break;
     case "captcha": {
       const waitS = event.wait_s ?? 0;
@@ -255,6 +255,18 @@ export function targetLabel(target: string | null, observation: ObservationEvent
   const index = targetIndex(target);
   if (index === null || !observation?.elements) return null;
   return observation.elements.find(([i]) => i === index)?.[2] ?? null;
+}
+
+// Where a run worked: the site of the last page it saw, else where it started.
+// A follow-up request sends it, so naming no site keeps working there.
+export function siteOf(run: Run): string {
+  const raw = run.observation?.url || run.plan?.start_url || "";
+  try {
+    const url = new URL(raw);
+    return url.protocol === "http:" || url.protocol === "https:" ? `${url.origin}/` : "";
+  } catch {
+    return "";
+  }
 }
 
 export function hostOf(url: string): string {

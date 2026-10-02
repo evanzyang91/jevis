@@ -62,6 +62,7 @@ def manager() -> RunManager:
 class StartRunRequest(BaseModel):
     goal: str
     url: str = ""
+    previous_url: str = ""  # where the last task in this conversation ran
     text_model: str | None = None
     vision_model: str | None = None
 
@@ -135,6 +136,7 @@ async def create_run(payload: StartRunRequest) -> RunResponse:
     run = await manager().start(
         goal=payload.goal.strip(),
         url=payload.url.strip(),
+        previous_url=payload.previous_url.strip(),
         text_model=text_model,
         vision_model=payload.vision_model,
     )

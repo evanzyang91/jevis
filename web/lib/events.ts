@@ -150,6 +150,7 @@ export type BudgetEvent = EventBase & {
   model_ms: number;
   load_ms: number;
   usd: number;
+  final?: boolean; // the run's totals, sent once however it ended
 };
 
 export type CaptchaEvent = EventBase & {

@@ -88,6 +88,9 @@ Return a JSON object with exactly one key, url: the site entry page.
 Rules:
 - If the goal names a site (Walmart, Amazon, YouTube), return that site.
   "buy X from Walmart" → https://www.walmart.com
+- `previous_site`, when present, is where the person's last task ran: this goal follows it up.
+  A site the goal names always wins over it ("now use Walmart" after Amazon → Walmart).
+  When the goal names no site and the same site still serves it, return `previous_site`.
 - Return the site entry point, not a deep link, search results page, or query string.
 - Food or drinks from a restaurant or café (Chipotle, McDonald's, Starbucks), or any food delivery
   request → https://www.doordash.com. Never the restaurant's own site: it cannot deliver an order.

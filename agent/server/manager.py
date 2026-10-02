@@ -13,6 +13,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from agent.executor import Frame, PlaywrightExecutor, uses_relay
@@ -22,6 +23,7 @@ from agent.planner.plan import plan_text
 from agent.providers import JevClient, adapter_for
 from agent.providers.registry import get
 from agent.supervisor import Supervisor
+from agent.supervisor.budget import Budget
 from agent.supervisor.loop import plan_event
 from agent.transport import BudgetEvent, Bus, ErrorEvent, FileLogger, FrameEvent, StatusEvent
 
@@ -49,11 +51,37 @@ def captcha_wait_s(*, headless: bool) -> float:
         return _DEFAULT_CAPTCHA_WAIT_S
 
 
+class _Metered:
+    """A text adapter that charges every call to `budget`. The site pick and
+    the planner run before the supervisor's own budget exists; without this
+    their cost never reached the task's total."""
+
+    def __init__(self, inner, budget: Budget) -> None:  # noqa: ANN001 — any text adapter
+        self._inner = inner
+        self._budget = budget
+
+    async def complete(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        result = await self._inner.complete(*args, **kwargs)
+        self._budget.spent(result.model, tokens_in=result.usage.prompt_tokens,
+                           tokens_out=result.usage.completion_tokens, latency_ms=result.latency_ms)
+        return result
+
+    def __getattr__(self, name: str):  # noqa: ANN204
+        return getattr(self._inner, name)
+
+
+def _web_url(raw: str) -> str:
+    """`raw` when it is an http(s) address, else empty."""
+    parts = urlparse(raw.strip())
+    return raw.strip() if parts.scheme in {"http", "https"} and parts.hostname else ""
+
+
 @dataclass
 class Run:
     run_id: UUID
     goal: str
     start_url: str
+    previous_url: str = ""  # where the last task in the conversation ran; a follow-up starts there
     bus: Bus = field(init=False)
     logger: FileLogger = field(init=False)
     task: asyncio.Task | None = None
@@ -61,6 +89,8 @@ class Run:
     supervisor: Supervisor | None = None
     state: object | None = None
     started: bool = False
+    early: Budget = field(default_factory=Budget)  # model calls before the supervisor: site pick, planner
+    totals_sent: bool = False
 
     def __post_init__(self) -> None:
         self.logger = FileLogger(self.run_id)
@@ -79,7 +109,8 @@ class RunManager:
             raise KeyError(run_id)
         return run
 
-    async def start(self, *, goal: str, url: str, text_model: str, vision_model: str | None = None) -> Run:
+    async def start(self, *, goal: str, url: str, text_model: str, vision_model: str | None = None,
+                    previous_url: str = "") -> Run:
         if uses_relay():
             # Runs in the user's own Chrome share one debugging connection: the
             # new run takes priority, and any older run still going stops first.
@@ -90,9 +121,10 @@ class RunManager:
         # Empty start_url signals "the planner picks it". Localisation to a
         # the user's regional storefront (AGENT_REGION) happens inside _drive so both suggested and
         # user-supplied US retailer URLs get the same treatment.
-        run = Run(run_id=run_id, goal=goal, start_url=url.strip())
+        run = Run(run_id=run_id, goal=goal, start_url=url.strip(), previous_url=_web_url(previous_url))
         self._runs[run_id] = run
-        log.debug("run %s: created (goal=%r, url=%r, text_model=%s)", run_id, goal, run.start_url, text_model)
+        log.debug("run %s: created (goal=%r, url=%r, previous=%r, text_model=%s)",
+                  run_id, goal, run.start_url, run.previous_url, text_model)
         run.task = asyncio.create_task(self._drive(run, text_model=text_model, vision_model=vision_model))
         return run
 
@@ -176,6 +208,7 @@ class RunManager:
                 return
 
             text_adapter = adapter_for(text_model, text_info.provider)
+            metered = _Metered(text_adapter, run.early)
 
             # A plan an earlier run of this goal finished every step of: no
             # site suggestion, no planner call (about six seconds).
@@ -186,16 +219,19 @@ class RunManager:
                 run.start_url = remembered[1]
             # If the user did not supply a URL, ask the text model to pick one
             # from the goal ("buy cake ingredients from Walmart" → walmart.com).
+            # A follow-up task names the site the last one ran on: a site the
+            # goal names wins, otherwise it stays there.
             # Then localise global retailers to the regional storefront (AGENT_REGION) so the
             # session runs against the correct catalog and pricing.
             if not run.start_url:
                 try:
-                    suggested = await suggest_url(adapter=text_adapter, goal=run.goal)
+                    suggested = await suggest_url(adapter=metered, goal=run.goal, previous=run.previous_url)
                     run.start_url = localise(suggested)
                     log.debug("run %s: suggested start url %s", run.run_id, run.start_url)
                 except Exception as err:  # noqa: BLE001
-                    log.warning("run %s: site suggestion failed (%s); defaulting to Google", run.run_id, err)
-                    run.start_url = "https://www.google.com/"
+                    fallback = run.previous_url or "https://www.google.com/"
+                    log.warning("run %s: site suggestion failed (%s); starting on %s", run.run_id, err, fallback)
+                    run.start_url = fallback
             else:
                 run.start_url = localise(run.start_url)
 
@@ -204,7 +240,7 @@ class RunManager:
                 log.debug("run %s: planning...", run.run_id)
                 from_memory = raw_plan is not None
                 if raw_plan is None:
-                    raw_plan = await plan_text(adapter=text_adapter, goal=run.goal, url=run.start_url)
+                    raw_plan = await plan_text(adapter=metered, goal=run.goal, url=run.start_url)
                 plan = parse_plan(raw_plan, goal=run.goal, url=run.start_url)
                 log.debug("run %s: planned, %d steps, %d rules", run.run_id, len(plan.subgoals),
                           len(plan.constraints))
@@ -264,13 +300,7 @@ class RunManager:
                         self.recall.keep_plan(run.goal, given_url, raw_plan, run.start_url)
                     elif remembered:
                         self.recall.drop_plan(run.goal, given_url)
-                # The run's totals, once, for the UI's results card: the
-                # heartbeat above is the only other budget event.
-                budget = run.state.budget
-                run.bus.publish(BudgetEvent(
-                    run_id=run.run_id, seq=await run.bus.next_seq(),
-                    steps=budget.steps, model_ms=budget.model_ms, load_ms=budget.load_ms, usd=budget.usd,
-                ))
+                await self._publish_totals(run)
                 await executor.stop_screencast()
                 log.debug("run %s: finished", run.run_id)
         except asyncio.CancelledError:
@@ -280,7 +310,27 @@ class RunManager:
             log.exception("run %s: fatal error", run.run_id)
             await self._emit_error(run, "server", err)
         finally:
+            # Stopped, failed or blocked early: the results card still gets its totals.
+            await self._publish_totals(run)
             run.logger.close()
+
+    async def _publish_totals(self, run: Run) -> None:
+        """The run's totals for the UI's results card, once, however it ended:
+        the supervisor's budget plus the site pick and planner before it. The
+        start heartbeat is the only other budget event."""
+        if run.totals_sent:
+            return
+        run.totals_sent = True
+        state = run.supervisor.state if run.supervisor is not None else None
+        late = state.budget if state is not None else Budget()
+        try:
+            run.bus.publish(BudgetEvent(
+                run_id=run.run_id, seq=await run.bus.next_seq(),
+                steps=late.steps, model_ms=run.early.model_ms + late.model_ms, load_ms=late.load_ms,
+                usd=run.early.usd + late.usd, final=True,
+            ))
+        except Exception:  # noqa: BLE001 — the totals are a courtesy, never a failure
+            log.exception("run %s: failed to publish totals", run.run_id)
 
     async def subscribe_events(self, run_id: UUID) -> "Subscription":
         run = self.get(run_id)

@@ -274,12 +274,12 @@ body:has(.wa[data-theme="dark"]) { background: #131314; }
    run is active. The border is a `::before` pseudo set to the panel's inset
    so it does not change the viewer's measured size — layout stays identical
    with or without the animation.
-   `position: sticky` keeps the viewer visible while the step list below it
-   scrolls past, and because new steps are rendered BELOW the viewer in the
-   DOM (see Turn.tsx), the viewer never moves when a trace is added. */
+   It scrolls with the turn: pinned (`position: sticky`), it covered the
+   steps and the results card as they scrolled up under it. New steps render
+   BELOW the viewer in the DOM (see Turn.tsx), so it never moves when a trace
+   is added. */
 .wa .turn-browser {
-  position: sticky;
-  top: 16px;
+  position: relative;
   z-index: 2;
   margin: 14px auto 4px;
   width: 100%;
@@ -347,8 +347,8 @@ body:has(.wa[data-theme="dark"]) { background: #131314; }
 .wa .notice strong { color: var(--amber); font-weight: 600; }
 .wa .notice .ghost { margin-top: 8px; }
 /* A site's human check: the person's turn, in the Chrome window. Over the
-   sticky live view it is always on screen, and it covers the lower part of a
-   picture that looks clickable but is not. */
+   live view it covers the lower part of a picture that looks clickable but
+   is not. */
 .wa .check-notice p { margin: 4px 0 0; }
 .wa .check-notice .check-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
 .wa .check-notice .check-actions .ghost { margin-top: 0; }
@@ -376,7 +376,8 @@ body:has(.wa[data-theme="dark"]) { background: #131314; }
   border-radius: 12px;
   background: var(--surface);
 }
-.wa .result-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.wa .result-head { display: flex; align-items: baseline; gap: 12px 40px; flex-wrap: wrap; }
+.wa .result-stat { display: flex; align-items: baseline; gap: 10px; }
 .wa .result-figure {
   font: 500 clamp(30px, 4.4vw, 40px)/1 var(--mono);
   font-variant-numeric: tabular-nums;
@@ -385,7 +386,7 @@ body:has(.wa[data-theme="dark"]) { background: #131314; }
 }
 .wa .result-caption { font-size: 13px; color: var(--muted); }
 .wa .tiles {
-  display: grid; grid-template-columns: repeat(5, 1fr);
+  display: grid; grid-template-columns: repeat(4, 1fr);
   margin: 16px -20px 0; border-top: 1px solid var(--line);
 }
 .wa .tile { padding: 12px 20px 14px; display: grid; gap: 2px; align-content: start; }

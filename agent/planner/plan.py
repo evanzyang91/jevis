@@ -192,11 +192,15 @@ async def plan_text(*, adapter: TextAdapter, goal: str, url: str | None = None) 
     return result.text
 
 
-async def suggest_url(*, adapter: TextAdapter, goal: str) -> str:
-    """Ask the model to name a starting URL when the user did not."""
+async def suggest_url(*, adapter: TextAdapter, goal: str, previous: str = "") -> str:
+    """Ask the model to name a starting URL when the user did not.
+
+    `previous` is the site the person's last task ran on: a follow-up that
+    names no site stays there, one that names a site goes to it."""
+    context = {"goal": goal, **({"previous_site": previous} if previous else {})}
     result = await adapter.complete(
         system=SUGGEST_URL,
-        user=json.dumps({"goal": goal}),
+        user=json.dumps(context),
         json_object=True,
     )
     try:

@@ -12,7 +12,7 @@ import { Logo } from "@/components/Logo";
 import { Turn } from "@/components/Turn";
 import { type CursorEvent, isCursorEvent } from "@/components/cursor";
 import type { FrameEvent } from "@/lib/events";
-import { type Run, actMs, isTerminal, newRun, reduce, seconds } from "@/lib/run";
+import { type Run, actMs, isTerminal, newRun, reduce, seconds, siteOf } from "@/lib/run";
 import { useFollowBottom } from "@/lib/follow";
 import { useVoice } from "@/lib/voice";
 import { subscribeEvents, subscribeFrames } from "@/lib/ws";
@@ -194,7 +194,15 @@ export default function Home() {
       const response = await fetch("/api/runs", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ goal: request, url: url.trim(), ...(model ? { text_model: model } : {}) }),
+        // The site box is for this request only. A follow-up that leaves it
+        // empty has its site picked again from its words; the last task's
+        // site is the fallback when the words name none.
+        body: JSON.stringify({
+          goal: request,
+          url: url.trim(),
+          previous_url: current ? siteOf(current) : "",
+          ...(model ? { text_model: model } : {}),
+        }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || data.error || "The agent server refused the task.");
@@ -202,6 +210,7 @@ export default function Home() {
       setRuns((prior) => [...prior, newRun(data.run_id, request)]);
       followBottom();
       setGoal("");
+      setUrl("");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
