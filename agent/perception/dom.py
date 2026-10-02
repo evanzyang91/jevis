@@ -8,8 +8,10 @@ never had to invent.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import time
 from pathlib import Path
 
 from playwright.async_api import Page
@@ -72,6 +74,7 @@ def _element_from(payload: dict) -> Element:
         opens=payload.get("opens"),
         visible=payload.get("visible"),
         group=payload.get("group"),
+        covered_by=payload.get("covered_by"),
         options=tuple(
             SelectOption(
                 label=option.get("label", ""),
@@ -104,6 +107,13 @@ def _looks_partial(state: dict) -> bool:
     return not (state.get("title") or "").strip()
 
 
+# How long `observe` keeps re-reading a page that has rendered nothing at all
+# (no controls, no text) before handing it over anyway.
+BLANK_WAIT_S = 10.0
+# Re-reads allowed while a partly rendered page keeps growing.
+GROWTH_READS = 5
+
+
 def _fingerprint(state: dict) -> str:
     """Full-content hash of the observation. Used for playbook keys and dev-UI
     comparisons; the cheap `marker` handles the hot path."""
@@ -132,20 +142,38 @@ async def observe(page: Page, *, include_text: bool = True) -> Observation:
     marker equality is not a valid accept criterion here because the marker
     hashes the top-32 role|name pairs, which for Walmart is the stable
     header shell while products stream in below.
+
+    A blank read (nothing rendered: no controls, no text) is not "stopped
+    growing", it has not started: keep re-reading for up to BLANK_WAIT_S
+    before giving up. The amazon.ca run of 2026-10-01 read an empty page,
+    accepted it after one equal re-read, and the policy ended the run.
     """
+    started = time.monotonic()
     state = await _evaluate_reader(page, include_text=include_text)
     retries = 0
-    for _ in range(5):
-        if not _looks_partial(state):
+    growth = 0
+    while True:
+        blank = bool(state.get("blank"))
+        if blank:
+            if time.monotonic() - started >= BLANK_WAIT_S:
+                break
+        elif growth >= GROWTH_READS or not _looks_partial(state):
             break
         try:
             await page.evaluate(_SETTLE_JS, [200, 3000])
         except Exception:  # noqa: BLE001 — non-fatal
             pass
+        if blank:
+            # Nothing mutates on a page that has not started rendering, so the
+            # settle returns at once; pace the re-reads instead of spinning.
+            await asyncio.sleep(0.4)
         prev_count = len(state.get("elements") or [])
         prev_title = (state.get("title") or "").strip()
         state = await _evaluate_reader(page, include_text=include_text)
         retries += 1
+        if blank:
+            continue
+        growth += 1
         next_count = len(state.get("elements") or [])
         next_title = (state.get("title") or "").strip()
         # If neither element count nor title moved, the page has stopped
@@ -177,6 +205,9 @@ async def observe(page: Page, *, include_text: bool = True) -> Observation:
         dialog_text=state.get("dialog_text") or None,
         dialog_status=state.get("dialog_status") or None,
         hydration_retries=int(state.get("_retries", 0)),
+        cart_count=int(state["cart_count"]) if isinstance(state.get("cart_count"), (int, float)) else None,
+        blank=bool(state.get("blank", False)),
+        cover=state.get("cover") or None,
     )
 
 
@@ -462,13 +493,241 @@ async def _test_dialog_status() -> None:
         raise ScrollTestFailure(f"dialog status after beans wrong: {after}")
 
 
-if __name__ == "__main__":
-    import asyncio
+class LoopFixTestFailure(AssertionError):
+    """An inline reachability, cart or blank-page test saw the wrong result."""
 
+
+def _headless_env() -> None:
+    import os
+
+    for key in ("AGENT_CDP_URL", "AGENT_CHROME_PROFILE", "AGENT_CHROME_CHANNEL"):
+        os.environ.pop(key, None)
+    os.environ["AGENT_PROFILE_DIR"] = "none"  # never touch the saved profile
+
+
+def _ref_of(observation: Observation, name: str) -> Element:
+    for element in observation.elements:
+        if element.name == name:
+            return element
+    raise LoopFixTestFailure(f"{name!r} not offered: {_names(observation)}")
+
+
+# Every control under one invisible full-viewport layer: what the DoorDash store
+# page looked like to the executor on 2026-10-01 (28 "Target covered" in a row).
+_INVISIBLE_LAYER = """<!doctype html><html><body style="margin:0">
+<header><a href="#home">Home</a> <button id="entree" onclick="window.clicked = 'entree'">Entree</button></header>
+<main><button onclick="window.clicked = 'add'">Add to cart - Burrito</button></main>
+<div id="veil" style="position:fixed;inset:0;z-index:50" onclick="window.veil = (window.veil || 0) + 1"></div>
+</body></html>"""
+
+# A dim backdrop without aria-modal over the page, a consent card on top.
+_CONSENT_WALL = """<!doctype html><html><body style="margin:0">
+<nav><a href="#a">Home</a> <a href="#b">Grocery</a> <a href="#c">Retail</a> <a href="#d">Deals</a></nav>
+<main><button>Entree</button> <button>Most Ordered</button></main>
+<div style="position:fixed;inset:0;z-index:40;background:rgba(0,0,0,0.5)"></div>
+<div style="position:fixed;left:400px;top:300px;width:400px;z-index:41;background:#fff">
+  <p>We use cookies</p><button>Accept all</button> <button>Essential only</button>
+</div></body></html>"""
+
+
+def _suggestions_page(escape_closes: bool) -> str:
+    """A search box whose suggestion list covers one result's add button."""
+    script = ("document.addEventListener('keydown', e => { if (e.key === 'Escape') "
+              "document.querySelector('[role=listbox]').remove(); });") if escape_closes else ""
+    return """<!doctype html><html><body style="margin:0">
+<input role="combobox" aria-label="Search" style="position:fixed;top:0;left:0;width:400px;height:30px">
+<ul role="listbox" aria-label="Search suggestions"
+    style="position:fixed;top:30px;left:0;width:400px;height:120px;margin:0;background:#fff;z-index:5">
+  <li role="option">eggs 12 large</li></ul>
+<main style="padding-top:60px">
+  <button style="margin-left:20px" onclick="window.added = 'eggs'">Add to cart - Eggs</button>
+  <button style="margin-left:600px" onclick="window.added = 'milk'">Add to cart - Milk</button>
+</main><script>""" + script + "</script></body></html>"
+
+
+async def _test_reachability() -> None:
+    """Unit: an invisible layer covers nothing; a visible blanket layer hides the
+    controls under it while its own stay; a suggestion list marks only the one
+    control it covers."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        await page.set_content(_INVISIBLE_LAYER)
+        veiled = await observe(page)
+        await page.set_content(_CONSENT_WALL)
+        wall = await observe(page)
+        await page.set_content(_suggestions_page(escape_closes=False))
+        listed = await observe(page)
+        await browser.close()
+    if veiled.cover is not None or any(e.covered_by for e in veiled.elements) or "Entree" not in _names(veiled):
+        raise LoopFixTestFailure(f"invisible layer counted as a cover: {veiled.cover}")
+    if _names(wall) != ["Accept all", "Essential only"] or not (wall.cover or {}).get("dropped"):
+        raise LoopFixTestFailure(f"blanket layer not handled: {_names(wall)} {wall.cover}")
+    eggs = _ref_of(listed, "Add to cart - Eggs")
+    milk = _ref_of(listed, "Add to cart - Milk")
+    if eggs.covered_by != 'listbox "Search suggestions"' or milk.covered_by is not None:
+        raise LoopFixTestFailure(f"partial cover wrong: eggs={eggs.covered_by!r} milk={milk.covered_by!r}")
+    if (listed.cover or {}).get("dropped"):
+        raise LoopFixTestFailure("a list over one control dropped controls")
+
+
+async def _e2e_click_through_and_dismiss() -> None:
+    """End to end through PlaywrightExecutor: a click under an invisible layer
+    lands on its target (the layer gets nothing and is restored); a click under
+    a suggestion list that Escape closes lands; one under a list that stays
+    raises Occluded naming the list."""
+    from agent.executor import Action, Occluded, PlaywrightExecutor
+
+    _headless_env()
+    async with PlaywrightExecutor(headless=True) as executor:
+        page = executor.page
+        await page.set_content(_INVISIBLE_LAYER)
+        entree = _ref_of(await observe(page), "Entree")
+        await executor.act(Action(id="click:entree", kind="click", label="Entree", locator=entree.ref,
+                                  role="button"))
+        through = await page.evaluate(
+            "[window.clicked, window.veil, document.getElementById('veil').style.pointerEvents]")
+        await page.set_content(_suggestions_page(escape_closes=True))
+        eggs = _ref_of(await observe(page), "Add to cart - Eggs")
+        await executor.act(Action(id="click:eggs", kind="click", label=eggs.name, locator=eggs.ref, role="button"))
+        dismissed = await page.evaluate("window.added")
+        await page.set_content(_suggestions_page(escape_closes=False))
+        eggs = _ref_of(await observe(page), "Add to cart - Eggs")
+        refused = ""
+        try:
+            await executor.act(Action(id="click:eggs", kind="click", label=eggs.name, locator=eggs.ref,
+                                      role="button"))
+        except Occluded as err:
+            refused = str(err)
+        stray = await page.evaluate("window.added || null")
+    if through != ["entree", None, ""]:
+        raise LoopFixTestFailure(f"click through the invisible layer wrong: {through}")
+    if dismissed != "eggs":
+        raise LoopFixTestFailure(f"suggestion list not dismissed before the click: {dismissed!r}")
+    if "Search suggestions" not in refused or stray is not None:
+        raise LoopFixTestFailure(f"a click under a list that stays was not refused: {refused!r} {stray!r}")
+
+
+def _search_form(label: str, swallow_enter: bool) -> str:
+    """A GET search form like Walmart's header: a combobox and a Search button."""
+    swallow = ("document.getElementById('q').addEventListener('keydown', "
+               "e => { if (e.key === 'Enter') e.preventDefault(); });") if swallow_enter else ""
+    return ("<!doctype html><html><head><title>Shop</title></head><body>"
+            "<form role='search' action='/results' method='get'>"
+            f"<input id='q' name='q' role='combobox' aria-label='{label}' autocomplete='off'>"
+            "<button type='submit' aria-label='Search'>Go</button>"
+            f"</form><script>{swallow}</script></body></html>")
+
+
+async def _fill_search(label: str, swallow_enter: bool) -> tuple[str, list[str]]:
+    """Fill a served search form through the executor; return the final URL and
+    every results request made."""
+    from agent.executor import Action, PlaywrightExecutor
+
+    _headless_env()
+    results: list[str] = []
+    async with PlaywrightExecutor(headless=True) as executor:
+        page = executor.page
+
+        async def serve(route) -> None:  # noqa: ANN001 — playwright Route
+            url = route.request.url
+            if "/results" in url:
+                results.append(url)
+                body = "<!doctype html><html><head><title>Results</title></head><body>Results</body></html>"
+            else:
+                body = _search_form(label, swallow_enter)
+            await route.fulfill(status=200, content_type="text/html", body=body)
+
+        await page.route("https://shop.test/**", serve)
+        await page.goto("https://shop.test/")
+        field = _ref_of(await observe(page), label)
+        outcome = await executor.act(Action(id="fill:q", kind="fill", label=field.name, locator=field.ref,
+                                            role=field.role, value="eggs"))
+        await page.wait_for_timeout(300)
+        return (outcome.final_url if outcome.url_changed else page.url), results
+
+
+async def _e2e_search_submits() -> None:
+    """End to end: a search fill submits once by Enter; when the field swallows
+    Enter (an autocomplete mid-mount), the field's Search button submits it;
+    an address combobox is typed into and never submitted."""
+    url, results = await _fill_search("Search", swallow_enter=False)
+    if "results?q=eggs" not in url or len(results) != 1:
+        raise LoopFixTestFailure(f"Enter did not submit exactly once: {url} {results}")
+    url, results = await _fill_search("Search", swallow_enter=True)
+    if "results?q=eggs" not in url or len(results) != 1:
+        raise LoopFixTestFailure(f"swallowed Enter was not followed by the Search button: {url} {results}")
+    url, results = await _fill_search("Enter Your Address", swallow_enter=False)
+    if results:
+        raise LoopFixTestFailure(f"an address combobox was submitted: {results}")
+
+
+_CARTS: dict[str, int | None] = {
+    '<header><button aria-label="Cart contains 13 items Total Amount $87.20">Cart</button></header>': 13,
+    '<div><button aria-label="0 items, open Order Cart">0</button></div>': 0,
+    '<header><a id="nav-cart" href="/gp/cart/view.html"><span>3</span> Cart</a></header>': 3,
+    '<main><a href="/ip/cart-organizer">Shopping Cart Organizer, 3 Tier</a>'
+    '<button>Add to cart - Flour</button></main>': None,
+}
+
+
+async def _test_cart_count() -> None:
+    """Unit: the cart count comes from the site's cart control (Walmart,
+    DoorDash, Amazon shapes); a product named "Cart" and an Add button are not
+    a cart."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        for html, want in _CARTS.items():
+            await page.set_content(f"<!doctype html><html><body>{html}<p>Shop</p></body></html>")
+            got = (await observe(page)).cart_count
+            if got != want:
+                await browser.close()
+                raise LoopFixTestFailure(f"cart count {got!r}, wanted {want!r} for {html}")
+        await browser.close()
+
+
+async def _test_blank_wait() -> None:
+    """Unit: a page that renders late is waited for, not handed over empty; one
+    that never renders is handed over (flagged blank) after BLANK_WAIT_S."""
+    global BLANK_WAIT_S
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        await page.set_content("<!doctype html><html><body><script>setTimeout(() => { document.body.innerHTML = "
+                               "'<button>Shop</button><p>Deals</p>'; }, 1500);</script></body></html>")
+        late = await observe(page)
+        await page.set_content("<!doctype html><html><body></body></html>")
+        saved, BLANK_WAIT_S = BLANK_WAIT_S, 1.0
+        try:
+            started = time.monotonic()
+            empty = await observe(page)
+            waited = time.monotonic() - started
+        finally:
+            BLANK_WAIT_S = saved
+        await browser.close()
+    if late.blank or "Shop" not in _names(late):
+        raise LoopFixTestFailure(f"late render not waited for: blank={late.blank} {_names(late)}")
+    if not empty.blank or waited < 1.0:
+        raise LoopFixTestFailure(f"never-rendered page: blank={empty.blank} after {waited:.1f}s")
+
+
+if __name__ == "__main__":
     asyncio.run(_test_dialog_status())
     asyncio.run(_unit_tests())
     asyncio.run(_e2e_modal_click_no_escape())
     asyncio.run(_e2e_covered_close_dismisses())
     asyncio.run(_e2e_dialog_scroll())
     asyncio.run(_e2e_page_scroll())
+    asyncio.run(_test_reachability())
+    asyncio.run(_e2e_click_through_and_dismiss())
+    asyncio.run(_e2e_search_submits())
+    asyncio.run(_test_cart_count())
+    asyncio.run(_test_blank_wait())
     print("dom.py inline scroll tests passed")

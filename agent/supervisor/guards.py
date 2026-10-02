@@ -29,6 +29,28 @@ class HistoryEntry:
     # URL after the action landed. Used by `url_cycling` to detect a run
     # that keeps bouncing between the same two or three pages.
     url: str = ""
+    # Why the action did not run: "covered" (another layer sat on the target)
+    # or "stale" (the target was gone). None when the executor ran it. A
+    # refused action is recorded, not dropped, so the marker-scoped streak
+    # (`already_taken`) and `inert_labels` stop a covered target from being
+    # retried more than twice — before this, a page under one overlay burned
+    # a step per control (28 in a row on DoorDash, 2026-10-01).
+    error: str | None = None
+    # Change in the page's cart count across this action (`Observation.
+    # cart_count` after minus before), when both reads found a cart badge.
+    # None when either read had no count. An "Add to cart" with delta 0 did
+    # not land.
+    cart_delta: int | None = None
+
+
+# Committing add controls: "Add to cart - X", "Add item to cart", "Add 1 to
+# order", "Add to bag". Shared by the supervisor's add confirmation.
+_ADD_LABEL = re.compile(r"^\s*add\b(?:\s+[\w-]+){0,2}?\s+to\s+(?:cart|order|bag|basket)\b", re.I)
+
+
+def is_add_label(label: str | None) -> bool:
+    """Whether a control label commits an item to the cart."""
+    return bool(_ADD_LABEL.match(label or ""))
 
 
 # ---- Cycle detection --------------------------------------------------------
@@ -150,6 +172,43 @@ def already_taken(history: Sequence[HistoryEntry], marker: str) -> frozenset[str
     return frozenset(ids | labels)
 
 
+# ---- Fill without submit ----------------------------------------------------
+
+
+def refill_bans(history: Sequence[HistoryEntry]) -> frozenset[str]:
+    """Ban typing into the field the run just typed into, when that fill did
+    not move the URL.
+
+    A search box with autocomplete opens a suggestion list on every fill, so
+    each re-fill "changes the page" and slips past `already_taken`; a Walmart
+    run filled Search four times in a row with four different terms and never
+    submitted (2026-10-01). After a fill the next step is to submit or pick a
+    result, so the same field is withheld for exactly one decision.
+
+    The ban is operation-scoped ("TYPE_TEXT:<label>", honoured by
+    `action_space.summarise`): a label ban would also hide the "Search" button
+    that shares the field's label, which is the control the run needs next.
+    """
+    if not history:
+        return frozenset()
+    last = history[-1]
+    if last.operation != "TYPE_TEXT" or last.url_changed or last.error is not None:
+        return frozenset()
+    return frozenset({f"TYPE_TEXT:{last.action_label}"})
+
+
+def wait_bans(history: Sequence[HistoryEntry], window: int = 3, limit: int = 2) -> frozenset[str]:
+    """Ban WAIT once it has been chosen `limit` times in the last `window` steps.
+
+    A WAIT now waits for the network and the DOM to go quiet, so a second one
+    in a row has already given a slow page its chance; a third only burns a
+    step and a decision. Returns the operation id, which `summarise` treats as
+    a whole-operation ban.
+    """
+    waits = sum(1 for entry in history[-window:] if entry.operation == "WAIT")
+    return frozenset({"WAIT"}) if waits >= limit else frozenset()
+
+
 # ---- Stale streak on unchanged page -----------------------------------------
 
 
@@ -239,8 +298,13 @@ def combined_ban(
     """Everything the supervisor should hide from the next decision.
 
     Combines: streak-of-unchanged on this marker (already_taken),
-    executor-refused (`covered`), labels stuck in a cycle, and labels
-    marked inert. The policy will not receive any of them.
+    run-long bans (`covered`), labels stuck in a cycle, labels marked inert,
+    an immediate re-fill of the field just filled, and WAIT spam. The policy
+    will not receive any of them.
+
+    A target the executor refused as covered or stale is in `history` with
+    page_changed False, so `already_taken` withholds it on this page and
+    `inert_labels` after its second refusal anywhere.
     """
     return (
         set(already_taken(history, marker))
@@ -248,6 +312,8 @@ def combined_ban(
         | set(cycling_labels(history))
         | set(repeated_label(history))
         | set(inert_labels(history))
+        | set(refill_bans(history))
+        | set(wait_bans(history))
     )
 
 
@@ -292,6 +358,82 @@ def _test_purchase_guard() -> None:
         raise GuardTestFailure("a goal that asks to buy was stopped")
 
 
+def _entry(step: int, operation: str, label: str, *, marker: str = "m", page_changed: bool = True,
+           url_changed: bool = False, error: str | None = None, text: str | None = None) -> HistoryEntry:
+    return HistoryEntry(step=step, operation=operation, target=None, action_id=f"{operation}:{label}",
+                        action_label=label, marker=marker, page_changed=page_changed,
+                        url_changed=url_changed, text=text, error=error)
+
+
+def _test_covered_retry_cap() -> None:
+    """Unit, replaying run 41c43879 (DoorDash, 28 "Target covered" in a row on
+    one marker): a refused target is withheld on its page at once, a label
+    refused twice anywhere is withheld, and four refusals on one unchanged page
+    end the run instead of twenty-eight."""
+    covered = [_entry(1, "CLICK", "Entree", page_changed=False, error="covered")]
+    if "Entree" not in combined_ban(covered, "m"):
+        raise GuardTestFailure("covered target offered again on the same page")
+    twice = [_entry(1, "CLICK", "Add to cart - Eggs", marker="m1", page_changed=False, error="covered"),
+             _entry(2, "SCROLL_DOWN", "Scroll down", marker="m1"),
+             _entry(3, "CLICK", "Add to cart - Eggs", marker="m2", page_changed=False, error="covered"),
+             _entry(4, "SCROLL_DOWN", "Scroll down", marker="m2")]
+    if "Add to cart - Eggs" not in combined_ban(twice, "m3"):
+        raise GuardTestFailure("target covered twice on different pages is still offered")
+    labels = ("Entree", "Close", "Essential only", "Next button of carousel")
+    spiral = [_entry(i, "CLICK", label, marker="1bbbxoz", page_changed=False, error="covered")
+              for i, label in enumerate(labels, start=1)]
+    if is_blocked_tail(spiral[:3]) or not is_blocked_tail(spiral):
+        raise GuardTestFailure("four covered refusals on one page did not end the run")
+
+
+def _test_refill_ban() -> None:
+    """Unit, replaying run 9ae93ef1 (Walmart, Search filled 3-4 times in a row,
+    each fill opening the suggestion list so the page "changed"): right after a
+    fill that did not move the URL, the same field is withheld but the "Search"
+    button with the same label is not; a submitted search lifts the ban."""
+    filled = [_entry(1, "TYPE_TEXT", "Search", text="granulated sugar")]
+    banned = combined_ban(filled, "m2")
+    if "TYPE_TEXT:Search" not in banned:
+        raise GuardTestFailure("re-fill of the field just filled was not withheld")
+    if "Search" in banned:
+        raise GuardTestFailure("the Search button was banned with the field")
+    submitted = [*filled, _entry(2, "CLICK", "Search", url_changed=True)]
+    if refill_bans(submitted):
+        raise GuardTestFailure("ban outlived the submit")
+    navigated = [_entry(1, "TYPE_TEXT", "Search", url_changed=True, text="eggs")]
+    if refill_bans(navigated):
+        raise GuardTestFailure("a fill that submitted (URL moved) banned the next search")
+    other_field = [_entry(1, "TYPE_TEXT", "First name", text="Ada")]
+    if "TYPE_TEXT:Last name" in combined_ban(other_field, "m"):
+        raise GuardTestFailure("filling one field banned a different field")
+
+
+def _test_wait_bans() -> None:
+    """Unit: a third WAIT in three steps is withheld; one WAIT is not."""
+    if wait_bans([_entry(1, "WAIT", "Wait")]):
+        raise GuardTestFailure("a single WAIT was banned")
+    if "WAIT" not in combined_ban([_entry(1, "WAIT", "Wait"), _entry(2, "WAIT", "Wait")], "m"):
+        raise GuardTestFailure("WAIT spam not withheld")
+    spaced = [_entry(1, "WAIT", "Wait"), _entry(2, "CLICK", "A"), _entry(3, "CLICK", "B"), _entry(4, "WAIT", "Wait")]
+    if wait_bans(spaced):
+        raise GuardTestFailure("WAITs far apart were banned")
+
+
+def _test_add_label() -> None:
+    """Unit: committing add controls are recognised; look-alikes are not."""
+    for label in ("Add to cart - Great Value Flour", "Add item to cart", "Add to order - CA$15.60", "add to bag",
+                  "Add 1 to cart"):
+        if not is_add_label(label):
+            raise GuardTestFailure(f"add control not recognised: {label!r}")
+    for label in ("Sign in to add to Favourites list, Flour", "Add address", "Options - Redpath Sugar", ""):
+        if is_add_label(label):
+            raise GuardTestFailure(f"non-add control taken for an add: {label!r}")
+
+
 if __name__ == "__main__":
     _test_purchase_guard()
+    _test_covered_retry_cap()
+    _test_refill_ban()
+    _test_wait_bans()
+    _test_add_label()
     print("guards.py inline tests passed")

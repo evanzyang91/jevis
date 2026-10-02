@@ -43,6 +43,7 @@ from .guards import (
     HistoryEntry,
     StaleTracker,
     combined_ban,
+    is_add_label,
     is_blocked_tail,
     reached_purchase,
     stale_over_limit,
@@ -218,18 +219,46 @@ class Supervisor:
     # ---- One-shot phases ---------------------------------------------------
 
     async def _observe(self, state: RunState) -> Observation:
-        observation = await observe(self.executor.page)  # type: ignore[attr-defined]
+        page = self.executor.page  # type: ignore[attr-defined]
+        observation = await observe(page)
+        previous = state.observation  # what the last action was decided on
+        if observation.blank and not (previous is not None and previous.blank and previous.url == observation.url):
+            # `observe` already waited (bounded) for a first render. An empty
+            # read must not reach the policy, which ends the run on it
+            # (amazon.ca, 2026-10-01: 0 elements, BLOCKED at step 0). Reload
+            # once and read again; a page still empty after that is handed on.
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=15_000)
+            except Exception:  # noqa: BLE001 — a slow reload still leaves a page to read
+                pass
+            observation = await observe(page)
         # Effect polling. A click/select/fill sometimes triggers an async
         # effect (cart badge, toast, in-place row swap) that lands after the
         # settle window inside the executor. If the marker did not move,
         # poll until it does or the deadline elapses. Ported from old jevis,
         # where it was the difference between a silent-fail Add-to-cart and
         # a caught one. Scrolls and waits are exempt: their effect is either
-        # immediate or a scroll-reveal counted elsewhere.
+        # immediate or a scroll-reveal counted elsewhere. An action the
+        # executor refused (covered, stale) did nothing, so nothing is polled.
         if state.history:
             last = state.history[-1]
+            if last.error is None and last.url_changed:
+                # A results page often paints its header before its results:
+                # Walmart's search read 21 controls, the policy chose WAIT,
+                # and the next read had 44 (2026-10-01). On a sparse page
+                # just reached, re-read while it is still growing (bounded)
+                # instead of spending a decision on WAIT.
+                for _ in range(3):
+                    if len(observation.elements) >= 30:
+                        break
+                    await asyncio.sleep(0.7)
+                    again = await observe(page)
+                    if len(again.elements) <= len(observation.elements):
+                        break
+                    observation = again
             if (
-                last.operation in {"CLICK", "SELECT", "TYPE_TEXT"}
+                last.error is None
+                and last.operation in {"CLICK", "SELECT", "TYPE_TEXT"}
                 and observation.marker == last.marker
             ):
                 deadline = time.monotonic() + (
@@ -237,14 +266,41 @@ class Supervisor:
                 )
                 while time.monotonic() < deadline:
                     await asyncio.sleep(0.1)
-                    observation = await observe(self.executor.page)  # type: ignore[attr-defined]
+                    observation = await observe(page)
                     if observation.marker != last.marker:
                         break
+            # Add confirmation. The button often turns into a stepper at once
+            # while the cart badge updates a beat later, so a moved marker is
+            # not proof the add landed: poll the cart count briefly too. Not
+            # when the add opened a dialog or a new page (options to choose).
+            before = previous.cart_count if previous is not None else None
+            if (
+                last.error is None and last.cart_delta is None
+                and last.operation == "CLICK" and is_add_label(last.action_label)
+                and before is not None and observation.cart_count is not None
+                and observation.cart_count <= before
+                and observation.url == previous.url
+                and not (observation.dialog_text and not previous.dialog_text)
+            ):
+                deadline = time.monotonic() + 2.5
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(0.25)
+                    observation = await observe(page)
+                    if observation.cart_count is not None and observation.cart_count > before:
+                        break
             # Retroactive correction: executor reports page_changed from a
-            # coarse signal; the reader's marker is authoritative.
-            actual_change = last.marker != observation.marker
-            if last.page_changed and not actual_change:
-                state.history[-1] = replace(last, page_changed=False)
+            # coarse signal; the reader's marker is authoritative. The cart
+            # delta records whether the action moved the cart count.
+            updated = last
+            if last.page_changed and last.marker == observation.marker:
+                updated = replace(updated, page_changed=False)
+            if (
+                last.error is None and last.cart_delta is None
+                and before is not None and observation.cart_count is not None
+            ):
+                updated = replace(updated, cart_delta=observation.cart_count - before)
+            if updated is not last:
+                state.history[-1] = updated
         state.budget.loaded(0)
         await self._publish(ObservationEvent(
             run_id=state.run_id,
@@ -262,8 +318,9 @@ class Supervisor:
             loading=observation.loading,
             viewport_w=observation.viewport[0],
             viewport_h=observation.viewport[1],
+            # A 4th item "covered" marks a control another layer sits on.
             elements=[
-                [idx, element.role, (element.name or "")[:80]]
+                [idx, element.role, (element.name or "")[:80], *(["covered"] if element.covered_by else [])]
                 for idx, element in enumerate(observation.elements)
             ],
         ))
@@ -451,13 +508,31 @@ class Supervisor:
             await self._emit_cursor_effect(state, target_bounds, action)
         try:
             outcome: Outcome = await self.executor.act(action)
-        except Occluded:
-            state.covered.add(action.label)
-            await self._emit_error("executor", RuntimeError("Target covered"))
-            return
-        except StalePage:
-            state.covered.add(action.label)
-            await self._emit_error("executor", RuntimeError("Stale target"))
+        except StalePage as err:
+            # Covered (Occluded) or gone. Recorded at this page's marker with
+            # page_changed False, so `already_taken` withholds the label on
+            # this page, `inert_labels` after a second refusal anywhere, and
+            # `is_blocked_tail` ends a run that only hits refusals. The old
+            # run-long ban (`state.covered`) hid each refusal from history: a
+            # DoorDash run tried 28 covered controls one by one (2026-10-01),
+            # and a label a passing suggestion list covered once stayed
+            # banned for the rest of the run.
+            covered = isinstance(err, Occluded)
+            state.history.append(HistoryEntry(
+                step=len(state.history) + 1,
+                operation=decision.operation,
+                target=decision.target,
+                action_id=action.id,
+                action_label=action.label,
+                marker=observation.marker,
+                page_changed=False,
+                url_changed=False,
+                text=action.value if action.kind == "fill" else None,
+                url=observation.url,
+                error="covered" if covered else "stale",
+            ))
+            await self._emit_error("executor", RuntimeError(
+                f"{'Target covered' if covered else 'Stale target'}: {str(err)[:200]}"))
             return
         if reached_purchase(outcome.final_url, state.goal):
             # Hard stop, whatever the prompt said: leave the checkout page and

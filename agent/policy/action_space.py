@@ -98,6 +98,11 @@ def _click_target(index: int, element) -> Target:  # noqa: ANN001
         hints["selected"] = str(element.selected).lower()
     if element.expanded is not None:
         hints["expanded"] = str(element.expanded).lower()
+    if element.covered_by:
+        # Another layer (a suggestion list, a sticky bar, a banner) sits on the
+        # control's centre. The executor tries to reach it (scroll, Escape),
+        # but the uncovered controls are the surer pick.
+        hints["covered_by"] = element.covered_by[:80]
     return Target(id=f"c{index}", label=label, action=action, hints=hints)
 
 
@@ -216,16 +221,33 @@ def resolve(space: ActionSpace, operation_id: str, target_id: str | None) -> Act
     raise KeyError(f"Unknown target {target_id!r} for operation {operation_id!r}")
 
 
+def scoped_ban(operation_id: str, label: str) -> str:
+    """An `exclude` entry that bans `label` under one operation only:
+    "TYPE_TEXT:Search" hides the Search field but not the Search button."""
+    return f"{operation_id}:{label}"
+
+
+def is_banned(operation_id: str, target: Target, banned: Iterable[str]) -> bool:
+    """Whether `banned` withholds `target` under `operation_id`: by target id,
+    by label, or by an operation-scoped label (`scoped_ban`)."""
+    banned = banned if isinstance(banned, (set, frozenset)) else set(banned)
+    return (target.id in banned or target.label in banned
+            or scoped_ban(operation_id, target.label) in banned)
+
+
 def summarise(space: ActionSpace, exclude: Iterable[str] = ()) -> dict[str, dict]:
     """The `questions` dict the Jev policy consumes. Each operation becomes
     one question. Targets under CLICK, TYPE_TEXT, SELECT each get their own
     question so unused heads never influence the winner.
 
-    `exclude` may contain operation ids (CLICK, WAIT), target ids (c9), or
-    target labels ("Go"). Guards on ids only survive one observation because
+    `exclude` may contain operation ids (CLICK, WAIT), target ids (c9),
+    target labels ("Go"), or operation-scoped labels ("TYPE_TEXT:Search",
+    see `scoped_ban`). Guards on ids only survive one observation because
     the reader re-stamps refs on every read; label bans are what carry across
     pages, and let `cycling_labels` / `repeated_label` / `inert_labels` block
-    a dead action wherever it reappears.
+    a dead action wherever it reappears. A scoped label is for a page where a
+    field and its button share a name (Walmart's "Search" box and "Search"
+    button): `refill_bans` hides the field without hiding the button.
 
     An operation whose targets are all banned is removed from the top-level
     choice too — otherwise Jev could pick it and hit the caller with an
@@ -252,7 +274,7 @@ def summarise(space: ActionSpace, exclude: Iterable[str] = ()) -> dict[str, dict
                 **dict(target.hints),
             }
             for target in operation.targets
-            if target.id not in banned and target.label not in banned
+            if not is_banned(operation.id, target, banned)
         }
 
     target_criteria: dict[str, dict[str, dict]] = {}
